@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { Grid3X3, Clock, PenTool, Combine, BookOpenText, Download, Upload, RotateCcw } from 'lucide-react';
+import { Grid3X3, Clock, PenTool, Combine, BookOpenText, Stamp, Download, Upload, RotateCcw } from 'lucide-react';
 import { useWritingSystemStore } from '@/store/useWritingSystemStore';
 
 const NavItem: React.FC<{ to: string; icon: React.ReactNode; label: string }> = ({ to, icon, label }) => (
@@ -91,6 +91,7 @@ export const Header: React.FC = () => {
           <NavItem to="/editor/radical" icon={<PenTool size={18} />} label="字根编辑" />
           <NavItem to="/composer" icon={<Combine size={18} />} label="字根组合" />
           <NavItem to="/lexicon" icon={<BookOpenText size={18} />} label="词条库" />
+          <NavItem to="/publish" icon={<Stamp size={18} />} label="发布台" />
         </nav>
 
         <div className="flex items-center gap-2">

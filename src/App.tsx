@@ -5,6 +5,7 @@ import { TimelinePage } from '@/pages/TimelinePage';
 import { RadicalEditorPage } from '@/pages/RadicalEditorPage';
 import { ComposerPage } from '@/pages/ComposerPage';
 import { LexiconPage } from '@/pages/LexiconPage';
+import { PublishPage } from '@/pages/PublishPage';
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
               <Route path="/editor/radical" element={<RadicalEditorPage />} />
               <Route path="/composer" element={<ComposerPage />} />
               <Route path="/lexicon" element={<LexiconPage />} />
+              <Route path="/publish" element={<PublishPage />} />
               <Route path="*" element={<Navigate to="/glyphs" replace />} />
             </Routes>
           </main>

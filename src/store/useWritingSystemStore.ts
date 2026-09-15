@@ -1,8 +1,16 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { WritingSystemStore, Radical, Lexeme, CompositionLayout } from '@/types';
+import type {
+  WritingSystemStore,
+  Radical,
+  Lexeme,
+  CompositionLayout,
+  PublishResult,
+  ReleasePackage,
+} from '@/types';
 import { generateId } from '@/utils/glyphUtils';
 import { MOCK_STAGES, MOCK_RADICALS, MOCK_LEXEMES } from '@/utils/mockData';
+import { buildReleasePackage, diffPackages, parseReleasePackage } from '@/utils/releaseUtils';
 
 const STORAGE_KEY = 'fictional-writing-system-v1';
 
@@ -10,6 +18,7 @@ const getInitialState = () => ({
   stages: MOCK_STAGES,
   radicals: MOCK_RADICALS,
   lexemes: MOCK_LEXEMES,
+  releases: [] as ReleasePackage[],
   selectedRadicalId: null as string | null,
   selectedStageId: MOCK_STAGES[MOCK_STAGES.length - 1]?.id || null,
   composingRadicalIds: [] as string[],
@@ -158,7 +167,72 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
         }
       },
 
-      resetAll: () => set(getInitialState()),
+      resetAll: () =>
+        set((state) => ({
+          ...getInitialState(),
+          // 已发布包为只读存档，重置工作数据时保留
+          releases: state.releases,
+        })),
+
+      publishRelease: async () => {
+        const state = get();
+        const sorted = [...state.releases].sort((a, b) => a.sequence - b.sequence);
+        const prev = sorted[sorted.length - 1] ?? null;
+        const sequence = (prev?.sequence ?? 0) + 1;
+
+        let pkg: ReleasePackage;
+        try {
+          pkg = await buildReleasePackage(
+            { stages: state.stages, radicals: state.radicals, lexemes: state.lexemes },
+            { sequence, prev, now: new Date().toISOString() }
+          );
+        } catch (e) {
+          // 校验失败：当前数据与既有发布包均保持不变
+          if (e instanceof Error && e.name === 'ReleaseValidationError') {
+            const issues = (e as unknown as { issues: PublishResult['issues'] }).issues;
+            return { ok: false, issues };
+          }
+          throw e;
+        }
+
+        // 同一份数据重复发布：内容与任一已存包一致即返回该包，不产生新包，结果保持一致
+        const existing = get().releases.find((r) => r.checksum === pkg.checksum);
+        if (existing) {
+          return { ok: true, pkg: existing, unchanged: true, issues: [] };
+        }
+
+        set((s) => ({ releases: [...s.releases, pkg] }));
+        return { ok: true, pkg, unchanged: false, issues: [] };
+      },
+
+      importReleasePackage: async (json) => {
+        const pkg = await parseReleasePackage(json);
+        const state = get();
+        if (state.releases.some((r) => r.checksum === pkg.checksum)) {
+          throw new Error('该发布包已在发布台中（校验值相同）');
+        }
+        // 导入包独立存档，重新编号并重算与本地末包的差异；当前字根/词条/阶段数据完全不动
+        const sorted = [...state.releases].sort((a, b) => a.sequence - b.sequence);
+        const localPrev = sorted[sorted.length - 1] ?? null;
+        const resequenced: ReleasePackage = {
+          ...pkg,
+          sequence: (localPrev?.sequence ?? 0) + 1,
+          diff: localPrev ? diffPackages(localPrev, pkg) : null,
+        };
+        set((s) => ({ releases: [...s.releases, resequenced] }));
+        return resequenced;
+      },
+
+      removeRelease: (sequence) =>
+        set((state) => ({
+          releases: state.releases.filter((r) => r.sequence !== sequence),
+        })),
+
+      serializeRelease: (sequence) => {
+        const pkg = get().releases.find((r) => r.sequence === sequence);
+        if (!pkg) throw new Error('发布包不存在');
+        return JSON.stringify(pkg, null, 2);
+      },
     }),
     {
       name: STORAGE_KEY,
@@ -166,9 +240,12 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
         stages: state.stages,
         radicals: state.radicals,
         lexemes: state.lexemes,
+        releases: state.releases,
       }),
       onRehydrateStorage: () => (state) => {
         if (state) {
+          // 兼容旧版本存档：无发布包字段时补空数组
+          if (!Array.isArray(state.releases)) state.releases = [];
           if (!state.selectedStageId && state.stages.length > 0) {
             state.selectedStageId = state.stages[state.stages.length - 1].id;
           }
