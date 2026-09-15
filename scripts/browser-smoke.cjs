@@ -228,6 +228,23 @@ const ok = (cond, msg) => {
   await page.waitForSelector('text=项待修');
   await page.waitForSelector('text=超出');
   ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), 'Z 后相对命令越界时发布按钮禁用');
+
+  // 平滑曲线 T 反射控制点越界：Q 结束 (90,50)、控制点 (50,10)，T 反射点 (130,90)
+  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
+  await page.goto(BASE + '#/glyphs');
+  await page.waitForSelector('text=字形库');
+  await page.locator('.group.relative.bg-parchment-50').first().click();
+  await page.waitForFunction((key) => !!localStorage.getItem(key), STORAGE_KEY);
+  await page.evaluate((key) => {
+    const data = JSON.parse(localStorage.getItem(key));
+    data.state.radicals[0].baseShape = 'M10 50 Q50 10 90 50 T90 50';
+    localStorage.setItem(key, JSON.stringify(data));
+  }, STORAGE_KEY);
+  await page.goto(BASE);
+  await page.goto(BASE + '#/publish');
+  await page.waitForSelector('text=项待修');
+  await page.waitForSelector('text=超出');
+  ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), 'T 反射控制点越界时发布按钮禁用');
   await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
 
   // ── 9. 全局控制台错误 ─────────────────────────────────────────

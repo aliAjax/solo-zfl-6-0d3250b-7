@@ -273,6 +273,11 @@ export function checkPath(svgPath: string): PathProblem[] {
   // 每个 M（首个坐标对）开启新子路径并重置该起点。
   let sx = 0;
   let sy = 0;
+  // 上一段曲线的类别与控制点（绝对坐标）：S 反射 C/S 的第二控制点，
+  // T 反射 Q/T 的控制点；上一段不是同类曲线时，反射点取当前点。
+  let prevCurve: 'C' | 'Q' | null = null;
+  let prevCx = 0;
+  let prevCy = 0;
   let i = 0;
   let started = false;
 
@@ -288,10 +293,12 @@ export function checkPath(svgPath: string): PathProblem[] {
     const rel = t.cmd !== upper;
     const argc = COMMAND_ARGS[upper];
 
-    // Z 不消费数字：闭合当前子路径，当前点回到当前子路径起点
+    // Z 不消费数字：闭合当前子路径，当前点回到当前子路径起点；
+    // 闭合后上一段曲线状态随之终结（按规范，Z 后再出现 S/T 没有可反射的控制点）
     if (upper === 'Z') {
       cx = sx;
       cy = sy;
+      prevCurve = null;
       continue;
     }
 
@@ -320,44 +327,89 @@ export function checkPath(svgPath: string): PathProblem[] {
           flagBounds(x, y);
           cx = x; cy = y;
           if (firstRound) {
-            // 新子路径：重置起点；隐式重复的坐标对等同于 L，沿用当前子路径
+            // 新子路径：重置起点与上一段曲线状态；
+            // 隐式重复的坐标对等同 L，沿用当前子路径
             started = true;
             sx = x;
             sy = y;
+            prevCurve = null;
+          } else {
+            prevCurve = null; // 隐式 lineto 同样打断平滑链
           }
           break;
         }
-        case 'L':
-        case 'T': {
+        case 'L': {
           const x = resolve(0, cx);
           const y = resolve(1, cy);
           flagBounds(x, y);
           cx = x; cy = y;
+          prevCurve = null;
+          break;
+        }
+        case 'T': {
+          // 二次平滑曲线：上一段是 Q/T 时反射其控制点，否则控制点取当前点
+          const cpx = prevCurve === 'Q' ? 2 * cx - prevCx : cx;
+          const cpy = prevCurve === 'Q' ? 2 * cy - prevCy : cy;
+          // 反射控制点越界即拦（贝塞尔曲线在控制点凸包内，控制点合规则主体不越框）
+          flagBounds(cpx, cpy);
+          const x = resolve(0, cx);
+          const y = resolve(1, cy);
+          flagBounds(x, y);
+          cx = x; cy = y;
+          // 下一段 T 反射的是本次实际使用的控制点
+          prevCurve = 'Q';
+          prevCx = cpx;
+          prevCy = cpy;
           break;
         }
         case 'H': {
           const x = resolve(0, cx);
           flagBounds(x, cy);
           cx = x;
+          prevCurve = null;
           break;
         }
         case 'V': {
           const y = resolve(0, cy);
           flagBounds(cx, y);
           cy = y;
+          prevCurve = null;
           break;
         }
         case 'C': {
           for (let p = 0; p < 3; p++) flagBounds(resolve(p * 2, cx), resolve(p * 2 + 1, cy));
+          // 记录第二控制点，供随后的 S 反射
+          prevCurve = 'C';
+          prevCx = resolve(2, cx);
+          prevCy = resolve(3, cy);
           cx = resolve(4, cx); cy = resolve(5, cy);
           break;
         }
-        case 'S':
+        case 'S': {
+          // 三次平滑曲线：上一段是 C/S 时反射其第二控制点，否则第一控制点取当前点
+          const c1x = prevCurve === 'C' ? 2 * cx - prevCx : cx;
+          const c1y = prevCurve === 'C' ? 2 * cy - prevCy : cy;
+          flagBounds(c1x, c1y); // 反射控制点
+          const c2x = resolve(0, cx);
+          const c2y = resolve(1, cy);
+          flagBounds(c2x, c2y); // 显式第二控制点
+          const x = resolve(2, cx);
+          const y = resolve(3, cy);
+          flagBounds(x, y);
+          cx = x; cy = y;
+          prevCurve = 'C';
+          prevCx = c2x;
+          prevCy = c2y;
+          break;
+        }
         case 'Q': {
           flagBounds(resolve(0, cx), resolve(1, cy));
           const x = resolve(2, cx);
           const y = resolve(3, cy);
           flagBounds(x, y);
+          prevCurve = 'Q';
+          prevCx = resolve(0, cx);
+          prevCy = resolve(1, cy);
           cx = x; cy = y;
           break;
         }
@@ -395,6 +447,7 @@ export function checkPath(svgPath: string): PathProblem[] {
             }
           }
           cx = x; cy = y;
+          prevCurve = null; // 弧段不提供 C/Q 反射控制点
           break;
         }
       }
