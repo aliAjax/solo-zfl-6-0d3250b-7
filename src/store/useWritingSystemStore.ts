@@ -10,7 +10,7 @@ import type {
 } from '@/types';
 import { generateId } from '@/utils/glyphUtils';
 import { MOCK_STAGES, MOCK_RADICALS, MOCK_LEXEMES } from '@/utils/mockData';
-import { buildReleasePackage, diffPackages, parseReleasePackage } from '@/utils/releaseUtils';
+import { buildReleasePackage, parseReleasePackage } from '@/utils/releaseUtils';
 
 const STORAGE_KEY = 'fictional-writing-system-v1';
 
@@ -176,15 +176,15 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
 
       publishRelease: async () => {
         const state = get();
-        const sorted = [...state.releases].sort((a, b) => a.sequence - b.sequence);
-        const prev = sorted[sorted.length - 1] ?? null;
-        const sequence = (prev?.sequence ?? 0) + 1;
+        // 上一包 = 存档中的最后一个包（本地发布或导入包均可作为对照基准）
+        const prev = state.releases[state.releases.length - 1] ?? null;
+        const sequence = state.releases.length + 1;
 
         let pkg: ReleasePackage;
         try {
           pkg = await buildReleasePackage(
             { stages: state.stages, radicals: state.radicals, lexemes: state.lexemes },
-            { sequence, prev, now: new Date().toISOString() }
+            { sequence, prev }
           );
         } catch (e) {
           // 校验失败：当前数据与既有发布包均保持不变
@@ -195,8 +195,9 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
           throw e;
         }
 
-        // 同一份数据重复发布：内容与任一已存包一致即返回该包，不产生新包，结果保持一致
-        const existing = get().releases.find((r) => r.checksum === pkg.checksum);
+        // 同一份字系重复发布（含清空存档后重建）：内容校验值相同即返回既有包，
+        // 不产生新包；空存档时构建结果是数据的纯函数，字节必然一致
+        const existing = get().releases.find((r) => r.contentChecksum === pkg.contentChecksum);
         if (existing) {
           return { ok: true, pkg: existing, unchanged: true, issues: [] };
         }
@@ -206,30 +207,33 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
       },
 
       importReleasePackage: async (json) => {
-        const pkg = await parseReleasePackage(json);
+        // 若本地恰好存有该包差异引用的基准包，连差异也一起按快照重建比对
+        let basis: ReleasePackage | null = null;
+        try {
+          const head = JSON.parse(json) as { diff?: { fromChecksum?: string | null } | null };
+          const from = head?.diff?.fromChecksum ?? null;
+          basis = from ? get().releases.find((r) => r.checksum === from) ?? null : null;
+        } catch {
+          // 交给 parseReleasePackage 报「非法 JSON」
+        }
+        // parseReleasePackage 已做：结构检查 + 发布门禁 + 重建比对 + 全包校验值复核（含差异）
+        const pkg = await parseReleasePackage(json, { prev: basis });
         const state = get();
         if (state.releases.some((r) => r.checksum === pkg.checksum)) {
           throw new Error('该发布包已在发布台中（校验值相同）');
         }
-        // 导入包独立存档，重新编号并重算与本地末包的差异；当前字根/词条/阶段数据完全不动
-        const sorted = [...state.releases].sort((a, b) => a.sequence - b.sequence);
-        const localPrev = sorted[sorted.length - 1] ?? null;
-        const resequenced: ReleasePackage = {
-          ...pkg,
-          sequence: (localPrev?.sequence ?? 0) + 1,
-          diff: localPrev ? diffPackages(localPrev, pkg) : null,
-        };
-        set((s) => ({ releases: [...s.releases, resequenced] }));
-        return resequenced;
+        // 制品原样入库：序号与差异是包的一部分（受全包校验值保护），不重写
+        set((s) => ({ releases: [...s.releases, pkg] }));
+        return pkg;
       },
 
-      removeRelease: (sequence) =>
+      removeRelease: (checksum) =>
         set((state) => ({
-          releases: state.releases.filter((r) => r.sequence !== sequence),
+          releases: state.releases.filter((r) => r.checksum !== checksum),
         })),
 
-      serializeRelease: (sequence) => {
-        const pkg = get().releases.find((r) => r.sequence === sequence);
+      serializeRelease: (checksum) => {
+        const pkg = get().releases.find((r) => r.checksum === checksum);
         if (!pkg) throw new Error('发布包不存在');
         return JSON.stringify(pkg, null, 2);
       },
@@ -244,8 +248,15 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
       }),
       onRehydrateStorage: () => (state) => {
         if (state) {
-          // 兼容旧版本存档：无发布包字段时补空数组
-          if (!Array.isArray(state.releases)) state.releases = [];
+          // 兼容旧版本存档：无发布包字段时补空数组；
+          // 清理早期形态（缺 contentChecksum）的过渡发布包
+          if (!Array.isArray(state.releases)) {
+            state.releases = [];
+          } else {
+            state.releases = state.releases.filter(
+              (r) => r && r.format === 'glyph-evolution-release' && typeof r.contentChecksum === 'string'
+            );
+          }
           if (!state.selectedStageId && state.stages.length > 0) {
             state.selectedStageId = state.stages[state.stages.length - 1].id;
           }

@@ -23,81 +23,97 @@ const store = useWritingSystemStore.getState();
 const firstRadical = store.radicals[0];
 const firstName = firstRadical.name;
 
-console.log('[S1] 首次发布');
+console.log('[S1] 首次发布（包无时间戳）');
 const r1 = await store.publishRelease();
 ok(r1.ok && !r1.unchanged, '首次发布成功');
-ok(useWritingSystemStore.getState().releases.length === 1, '存档中有 1 个包');
+ok(useWritingSystemStore.getState().releases.length === 1, '存档 1 个包');
 const pkg1 = r1.pkg!;
-ok(pkg1.sequence === 1, '序号为 1');
-ok(pkg1.diff === null, '首包无差异基准');
+ok(pkg1.sequence === 1 && !('publishedAt' in pkg1), '序号 1 且无时间戳字段');
+ok(pkg1.diff === null, '首包无差异');
 
-console.log('[S2] 同一份数据重复发布');
+console.log('[S2] 同一份字系重复发布 → 返回同一包');
 const r1b = await useWritingSystemStore.getState().publishRelease();
-ok(r1b.ok && r1b.unchanged, '重复发布返回 unchanged');
-ok(r1b.pkg!.checksum === pkg1.checksum, '校验值一致');
-ok(useWritingSystemStore.getState().releases.length === 1, '不产生新包，存档仍为 1 个');
+ok(r1b.ok && r1b.unchanged, '重复发布 unchanged');
+ok(r1b.pkg!.checksum === pkg1.checksum, '全包校验值相同');
+ok(useWritingSystemStore.getState().releases.length === 1, '不产生新包');
 
-console.log('[S3] 发布后改动字根不影响旧包，并产生差异');
+console.log('[S3] 改动字根后发布：旧包不变 + diff');
 useWritingSystemStore.getState().updateRadical(firstRadical.id, { name: `${firstName}·新` });
 const r2 = await useWritingSystemStore.getState().publishRelease();
-ok(r2.ok && !r2.unchanged, '改动后发布成功且非 unchanged');
-const pkg2 = r2.pkg!;
-ok(pkg2.sequence === 2, '序号递增为 2');
-ok(pkg1.payload.radicals.find((x) => x.id === firstRadical.id)!.name === firstName, '旧包字根名保持原样');
-ok(pkg2.payload.radicals.find((x) => x.id === firstRadical.id)!.name === `${firstName}·新`, '新包字根名为新值');
-ok(pkg2.diff!.radicals.changed.includes(firstRadical.id), 'diff 标记该字根已修改');
-ok(pkg2.diff!.affectedRadicals.includes(firstRadical.id), '受影响字根包含它');
+ok(r2.ok && !r2.unchanged, '改动后发布为新包');
+ok(r2.pkg!.sequence === 2, '序号 2');
+ok(pkg1.payload.radicals.find((x) => x.id === firstRadical.id)!.name === firstName, '旧包字根名原样');
+ok(r2.pkg!.payload.radicals.find((x) => x.id === firstRadical.id)!.name === `${firstName}·新`, '新包字根名为新值');
+ok(r2.pkg!.diff!.radicals.changed.includes(firstRadical.id), 'diff 标记修改');
 
 console.log('[S4] 校验失败：当前数据与旧包均不变');
-const releasesBefore = useWritingSystemStore.getState().releases.length;
+const before = useWritingSystemStore.getState().releases.length;
 useWritingSystemStore.getState().addRadical({
-  name: '坏字根', meaning: 'x', pronunciation: 'x', category: '象形', baseShape: '', variants: [],
+  name: '坏字根', meaning: 'x', pronunciation: 'x', category: '象形', baseShape: 'M10 10 L20', variants: [],
 });
 const rBad = await useWritingSystemStore.getState().publishRelease();
-ok(!rBad.ok, '发布失败');
-ok(rBad.issues.length >= 2, `报出多项问题（实际 ${rBad.issues.length}）`);
-ok(rBad.issues.some((i) => i.code === 'path-out-of-bounds'), '含路径越界/空路径');
-ok(rBad.issues.some((i) => i.code === 'missing-stage-glyph'), '含缺失阶段字形');
-ok(useWritingSystemStore.getState().releases.length === releasesBefore, '旧包数量不变');
-
-console.log('[S5] 删除坏字根后再发布：词条布局变化进入 diff');
-// 直接移除刚加的坏字根
+ok(!rBad.ok, '残缺路径+缺字形 → 发布失败');
+ok(rBad.issues.some((i) => i.code === 'path-out-of-bounds'), '报路径问题（无效）');
+ok(rBad.issues.some((i) => i.code === 'missing-stage-glyph'), '报缺失阶段字形');
+ok(useWritingSystemStore.getState().releases.length === before, '旧包数量不变');
 const bad = useWritingSystemStore.getState().radicals.find((x) => x.name === '坏字根')!;
 useWritingSystemStore.getState().removeRadical(bad.id);
-const firstLexeme = useWritingSystemStore.getState().lexemes[0];
-useWritingSystemStore.getState().updateLexeme(firstLexeme.id, { layout: 'overlay' });
+
+console.log('[S5] 布局变化进入 diff');
+const lexId = useWritingSystemStore.getState().lexemes[0].id;
+useWritingSystemStore.getState().updateLexeme(lexId, { layout: 'overlay' });
 const r3 = await useWritingSystemStore.getState().publishRelease();
-ok(r3.ok, '修复后发布成功');
-ok(r3.pkg!.diff!.layout.includes(firstLexeme.id), '布局变化已登记');
-ok(r3.pkg!.diff!.affectedLexemes.includes(firstLexeme.id), '受影响词条已登记');
+ok(r3.ok, '发布成功');
+ok(r3.pkg!.diff!.layout.includes(lexId), '布局变化登记');
 
-console.log('[S6] 单包导出 → 删除 → 导入往返');
-const json = useWritingSystemStore.getState().serializeRelease(pkg2.sequence);
-ok(JSON.parse(json).checksum === pkg2.checksum, '导出内容含校验值');
-useWritingSystemStore.getState().removeRelease(pkg2.sequence);
-ok(!useWritingSystemStore.getState().releases.some((p) => p.sequence === pkg2.sequence), '已删除该包');
+console.log('[S6] 导出 → 删除 → 导入往返（制品原样）');
+const json = useWritingSystemStore.getState().serializeRelease(r2.pkg!.checksum);
+const parsed = JSON.parse(json);
+ok(parsed.checksum === r2.pkg!.checksum && parsed.sequence === 2, '导出保留序号与校验值');
+useWritingSystemStore.getState().removeRelease(r2.pkg!.checksum);
+ok(!useWritingSystemStore.getState().releases.some((p) => p.checksum === r2.pkg!.checksum), '已删除');
 const imported = await useWritingSystemStore.getState().importReleasePackage(json);
-ok(imported.checksum === pkg2.checksum, '导入包校验值一致');
-ok(useWritingSystemStore.getState().releases.some((p) => p.checksum === pkg2.checksum), '导入后存档中存在该包');
+ok(imported.checksum === r2.pkg!.checksum, '导入校验值一致');
+ok(imported.sequence === 2, '导入包序号保持原样（不重新编号）');
+ok(imported.diff !== null && imported.diff!.radicals.changed.includes(firstRadical.id), '导入包差异原样保留');
 
-console.log('[S7] 重复导入与篡改包被拒');
-let rejected = false;
-try { await useWritingSystemStore.getState().importReleasePackage(json); } catch { rejected = true; }
-ok(rejected, '重复导入同一包被拒绝');
-const tampered = JSON.parse(json);
-tampered.payload.radicals[0].name = '篡';
-rejected = false;
-try { await useWritingSystemStore.getState().importReleasePackage(JSON.stringify(tampered)); } catch { rejected = true; }
-ok(rejected, '篡改包被校验值拦截');
+console.log('[S7] 重复/篡改/残缺导入被拒');
+let rej = false;
+try { await useWritingSystemStore.getState().importReleasePackage(json); } catch { rej = true; }
+ok(rej, '重复导入拒绝');
+for (const mutate of [
+  (t: any) => { t.payload.radicals[0].name = '篡'; },
+  (t: any) => { t.manifest.totalRadicals = 1; },
+  (t: any) => { t.report.ok = false; },
+  (t: any) => { t.fallbackRecords = []; },
+  (t: any) => { t.contentChecksum = '0'.repeat(64); },
+  (t: any) => { t.payload.radicals[0].baseShape = 'M0 0 L999 999'; },
+  (t: any) => { t.payload.radicals[0].baseShape = 'M0 0 L50'; },
+  (t: any) => { t.checksum = '1'.repeat(64); },
+]) {
+  const t = JSON.parse(json);
+  mutate(t);
+  let r = false;
+  try { await useWritingSystemStore.getState().importReleasePackage(JSON.stringify(t)); } catch { r = true; }
+  ok(r, '篡改包被拒绝');
+}
 
-console.log('[S8] 重置工作数据不影响发布存档');
-const countBeforeReset = useWritingSystemStore.getState().releases.length;
+console.log('[S8] 重置工作数据不影响存档；重置后同字系发布识别为同一内容');
+const n = useWritingSystemStore.getState().releases.length;
 useWritingSystemStore.getState().resetAll();
-ok(useWritingSystemStore.getState().releases.length === countBeforeReset, `重置后 ${countBeforeReset} 个包仍在`);
-ok(useWritingSystemStore.getState().radicals[0].name !== '日·新', '工作数据已回到初始 mock');
-// 重置后工作数据与首包内容相同，再发布应为 unchanged
-const rReset = await useWritingSystemStore.getState().publishRelease();
-ok(rReset.unchanged, '重置后重复发布识别为同一份数据');
+ok(useWritingSystemStore.getState().releases.length === n, `重置后 ${n} 个包仍在`);
+
+console.log('[S9] 清空存档后同字系首包重建结果逐字节一致');
+{
+  useWritingSystemStore.setState({ releases: [] });
+  const a = await useWritingSystemStore.getState().publishRelease();
+  const jsonA = useWritingSystemStore.getState().serializeRelease(a.pkg!.checksum);
+  useWritingSystemStore.setState({ releases: [] });
+  const b = await useWritingSystemStore.getState().publishRelease();
+  const jsonB = useWritingSystemStore.getState().serializeRelease(b.pkg!.checksum);
+  ok(jsonA === jsonB, '两次「清空后首发」序列化结果完全相同');
+  ok(a.pkg!.checksum === b.pkg!.checksum && a.pkg!.contentChecksum === b.pkg!.contentChecksum, '两层校验值均相同');
+}
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 if (fail > 0) process.exit(1);

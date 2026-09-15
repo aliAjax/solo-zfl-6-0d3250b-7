@@ -16,11 +16,14 @@ export const PublishPage: React.FC = () => {
   const [unchangedHint, setUnchangedHint] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
   const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  const [selectedChecksum, setSelectedChecksum] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const sorted = useMemo(() => [...releases].sort((a, b) => b.sequence - a.sequence), [releases]);
-  const selected = sorted.find((p) => p.sequence === selectedSeq) ?? sorted[0] ?? null;
+  const sorted = useMemo(
+    () => [...releases].sort((a, b) => a.sequence - b.sequence || a.checksum.localeCompare(b.checksum)),
+    [releases]
+  );
+  const selected = sorted.find((p) => p.checksum === selectedChecksum) ?? sorted[sorted.length - 1] ?? null;
 
   const handlePublish = async () => {
     setPublishing(true);
@@ -32,12 +35,8 @@ export const PublishPage: React.FC = () => {
         setPublishError(`发布中止：${result.issues.length} 项校验未通过，当前数据与既有发布包均未改动。`);
         return;
       }
-      if (result.unchanged) {
-        setUnchangedHint(true);
-        if (result.pkg) setSelectedSeq(result.pkg.sequence);
-      } else if (result.pkg) {
-        setSelectedSeq(result.pkg.sequence);
-      }
+      if (result.pkg) setSelectedChecksum(result.pkg.checksum);
+      setUnchangedHint(!!result.unchanged);
     } catch (e) {
       setPublishError(e instanceof Error ? e.message : '发布失败');
     } finally {
@@ -46,7 +45,7 @@ export const PublishPage: React.FC = () => {
   };
 
   const handleExport = (pkg: ReleasePackage) => {
-    const json = serializeRelease(pkg.sequence);
+    const json = serializeRelease(pkg.checksum);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -61,10 +60,10 @@ export const PublishPage: React.FC = () => {
     reader.onload = async (ev) => {
       try {
         const pkg = await importReleasePackage(ev.target?.result as string);
-        setImportMsg({ ok: true, text: `已导入第 ${String(pkg.sequence).padStart(2, '0')} 号发布包（校验值验真通过）` });
-        setSelectedSeq(pkg.sequence);
+        setImportMsg({ ok: true, text: `已导入第 ${String(pkg.sequence).padStart(2, '0')} 号发布包（重建与校验值验真通过）` });
+        setSelectedChecksum(pkg.checksum);
       } catch (e) {
-        setImportMsg({ ok: false, text: `导入失败：${e instanceof Error ? e.message : '文件无效'}` });
+        setImportMsg({ ok: false, text: `导入被拒绝：${e instanceof Error ? e.message : '文件无效'}` });
       }
     };
     reader.readAsText(file);
@@ -76,14 +75,14 @@ export const PublishPage: React.FC = () => {
         `确定删除第 ${String(pkg.sequence).padStart(2, '0')} 号发布包吗？\n校验值：${pkg.checksum.slice(0, 16)}…\n删除后仅移除本地存档，不影响当前字根、词条与阶段数据。`
       )
     ) {
-      removeRelease(pkg.sequence);
-      if (selectedSeq === pkg.sequence) setSelectedSeq(null);
+      removeRelease(pkg.checksum);
+      if (selectedChecksum === pkg.checksum) setSelectedChecksum(null);
     }
   };
 
-  const idx = selected ? sorted.findIndex((p) => p.sequence === selected.sequence) : -1;
-  const prevPkg = idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1] : null;
-  const nextPkg = idx > 0 ? sorted[idx - 1] : null;
+  const idx = selected ? sorted.findIndex((p) => p.checksum === selected.checksum) : -1;
+  const prevPkg = idx > 0 ? sorted[idx - 1] : null;
+  const nextPkg = idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1] : null;
 
   return (
     <div className="container mx-auto px-6 py-8">
@@ -161,12 +160,12 @@ export const PublishPage: React.FC = () => {
           <div className="xl:col-span-3 animate-fade-up" style={{ animationDelay: '120ms' }}>
             <div className="bg-parchment-50 rounded-2xl shadow-scroll border border-parchment-300/40 p-3 sticky top-28">
               <div className="space-y-1.5 max-h-[70vh] overflow-y-auto pr-1">
-                {sorted.map((p) => {
-                  const active = selected?.sequence === p.sequence;
+                {[...sorted].reverse().map((p) => {
+                  const active = selected?.checksum === p.checksum;
                   return (
                     <button
-                      key={`${p.sequence}-${p.checksum}`}
-                      onClick={() => setSelectedSeq(p.sequence)}
+                      key={p.checksum}
+                      onClick={() => setSelectedChecksum(p.checksum)}
                       className={`w-full text-left px-3.5 py-3 rounded-xl border transition-all ${
                         active
                           ? 'bg-vermilion-500/10 border-vermilion-500/40 shadow-seal'
@@ -177,8 +176,8 @@ export const PublishPage: React.FC = () => {
                         <span className={`font-kai text-base font-bold ${active ? 'text-vermilion-500' : 'text-ink-500'}`}>
                           第 {String(p.sequence).padStart(2, '0')} 号
                         </span>
-                        <span className="text-[10px] text-ink-200 font-song">
-                          {new Date(p.publishedAt).toLocaleDateString('zh-CN')}
+                        <span className="text-[10px] text-ink-200 font-mono">
+                          {p.contentChecksum.slice(0, 10)}
                         </span>
                       </div>
                       <div className="text-[10px] text-ink-300 font-song mt-1 flex items-center gap-1.5 flex-wrap">
@@ -202,7 +201,7 @@ export const PublishPage: React.FC = () => {
             {sorted.length > 1 && selected && (
               <div className="flex items-center justify-between">
                 <button
-                  onClick={() => prevPkg && setSelectedSeq(prevPkg.sequence)}
+                  onClick={() => prevPkg && setSelectedChecksum(prevPkg.checksum)}
                   disabled={!prevPkg}
                   className="flex items-center gap-1 text-xs font-kai px-3 py-1.5 rounded-lg text-ink-400 disabled:opacity-30 hover:bg-parchment-50 border border-parchment-300/50"
                 >
@@ -210,7 +209,7 @@ export const PublishPage: React.FC = () => {
                   更早一包（第 {prevPkg ? String(prevPkg.sequence).padStart(2, '0') : '—'} 号）
                 </button>
                 <button
-                  onClick={() => nextPkg && setSelectedSeq(nextPkg.sequence)}
+                  onClick={() => nextPkg && setSelectedChecksum(nextPkg.checksum)}
                   disabled={!nextPkg}
                   className="flex items-center gap-1 text-xs font-kai px-3 py-1.5 rounded-lg text-ink-400 disabled:opacity-30 hover:bg-parchment-50 border border-parchment-300/50"
                 >
@@ -221,7 +220,7 @@ export const PublishPage: React.FC = () => {
             )}
             {selected && (
               <PackageDetail
-                key={selected.sequence}
+                key={selected.checksum}
                 pkg={selected}
                 allPackages={sorted}
                 onExport={handleExport}

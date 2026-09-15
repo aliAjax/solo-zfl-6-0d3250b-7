@@ -10,14 +10,10 @@ import {
   Trash2,
   Lock,
   Fingerprint,
-  CalendarClock,
+  Layers,
 } from 'lucide-react';
-import type { ReleasePackage, StageFallbackEntry } from '@/types';
-import {
-  CHECK_LABELS,
-  diffPackages,
-  releaseLexemeLabel,
-} from '@/utils/releaseUtils';
+import type { ReleasePackage } from '@/types';
+import { CHECK_LABELS, diffPackages, releaseLexemeLabel } from '@/utils/releaseUtils';
 import { PackageGlyph } from './PackageGlyph';
 import { DiffPanel } from './DiffPanel';
 
@@ -25,17 +21,10 @@ type Tab = 'manifest' | 'fallback' | 'report' | 'diff';
 
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   { key: 'manifest', label: '字形清单', icon: <ScrollText size={15} /> },
-  { key: 'fallback', label: '阶段回退记录', icon: <History size={15} /> },
+  { key: 'fallback', label: '阶段取形记录', icon: <History size={15} /> },
   { key: 'report', label: '校验报告', icon: <ShieldCheck size={15} /> },
   { key: 'diff', label: '与上一包对照', icon: <GitCompare size={15} /> },
 ];
-
-const FALLBACK_STATUS: Record<StageFallbackEntry['status'], { text: string; cls: string }> = {
-  exact: { text: '本相', cls: 'bg-bronze-400/12 text-bronze-500 border-bronze-400/30' },
-  fallback: { text: '回退', cls: 'bg-[#8B5A2B]/12 text-[#8B5A2B] border-[#8B5A2B]/30' },
-  base: { text: '基础', cls: 'bg-parchment-400/20 text-parchment-500 border-parchment-400/40' },
-  missing: { text: '缺形', cls: 'bg-vermilion-500/10 text-vermilion-500 border-vermilion-500/30' },
-};
 
 export const PackageDetail: React.FC<{
   pkg: ReleasePackage;
@@ -95,12 +84,12 @@ export const PackageDetail: React.FC<{
             </div>
             <div className="flex items-center gap-4 text-xs text-parchment-300/70 font-song flex-wrap">
               <span className="flex items-center gap-1">
-                <CalendarClock size={12} />
-                {new Date(pkg.publishedAt).toLocaleString('zh-CN')}
-              </span>
-              <span>
+                <Layers size={12} />
                 {pkg.report.summary.stages} 阶段 · {pkg.report.summary.radicals} 字根 ·{' '}
                 {pkg.report.summary.lexemes} 词条 · {pkg.report.summary.glyphs} 字形
+              </span>
+              <span className="font-mono text-[10px] text-parchment-300/50">
+                content {pkg.contentChecksum.slice(0, 16)}…
               </span>
             </div>
           </div>
@@ -173,7 +162,7 @@ export const PackageDetail: React.FC<{
                 >
                   {bases.map((p) => (
                     <option key={p.checksum} value={p.checksum}>
-                      第 {String(p.sequence).padStart(2, '0')} 号包 · {new Date(p.publishedAt).toLocaleDateString('zh-CN')}
+                      第 {String(p.sequence).padStart(2, '0')} 号包 · {p.report.summary.radicals} 字根 · {p.contentChecksum.slice(0, 8)}
                     </option>
                   ))}
                 </select>
@@ -246,54 +235,32 @@ const ManifestTab: React.FC<{ pkg: ReleasePackage; stages: string[] }> = ({ pkg,
 
 const FallbackTab: React.FC<{ pkg: ReleasePackage }> = ({ pkg }) => {
   const stages = useMemo(() => [...pkg.payload.stages].sort((a, b) => a.order - b.order), [pkg]);
-  // 按阶段分组（记录本身已按阶段顺序、字根名排序生成）
-  const groups = useMemo(() => {
-    const map = new Map<string, StageFallbackEntry[]>();
+  const byStage = useMemo(() => {
+    const map = new Map<string, Set<string>>();
     for (const r of pkg.fallbackRecords) {
-      const list = map.get(r.stageId) ?? [];
-      list.push(r);
-      map.set(r.stageId, list);
+      const set = map.get(r.stageId) ?? new Set<string>();
+      set.add(r.radicalId);
+      map.set(r.stageId, set);
     }
-    return stages.map((s) => ({ stage: s, records: map.get(s.id) ?? [] }));
-  }, [pkg, stages]);
-
-  const nonExact = pkg.fallbackRecords.filter((r) => r.status !== 'exact');
+    return map;
+  }, [pkg]);
 
   return (
     <div>
       <p className="text-xs font-song text-ink-300 mb-4">
-        记录每个字根在各阶段的取形来源：
-        <span className="text-bronze-500 font-kai">本相</span> 为该阶段专形；
-        <span className="text-[#8B5A2B] font-kai">回退</span> 为沿用更早阶段；
-        <span className="text-parchment-500 font-kai">基础</span> 为仅基础字形；
-        <span className="text-vermilion-500 font-kai">缺形</span> 为无任何字形。
-        {nonExact.length === 0 && ' 本包所有字根在各阶段均有专形，无回退。'}
+        记录每个字根在各阶段的取形来源。发布门禁要求每个字根在每个阶段都有专形，
+        因此合法包内记录全部为
+        <span className="text-bronze-500 font-kai"> 本相 </span>
+        —— 回退/基础/缺形在门禁下不可达，不会进入发布包。共 {pkg.fallbackRecords.length} 条（
+        {pkg.report.summary.radicals} 字根 × {stages.length} 阶段）。
       </p>
-
-      {nonExact.length > 0 && (
-        <div className="mb-5 rounded-xl border border-[#8B5A2B]/25 bg-[#8B5A2B]/6 p-4">
-          <h4 className="font-kai text-sm font-bold text-[#8B5A2B] mb-2">回退/缺形明细（{nonExact.length}）</h4>
-          <ul className="space-y-1 max-h-48 overflow-y-auto">
-            {nonExact.map((r, i) => (
-              <li key={i} className="text-xs font-song text-ink-400 flex items-center gap-2">
-                <span className={`px-1.5 py-0.5 rounded border text-[10px] font-kai ${FALLBACK_STATUS[r.status].cls}`}>
-                  {FALLBACK_STATUS[r.status].text}
-                </span>
-                <span className="font-kai text-ink-500">{r.radicalName}</span>
-                <span className="text-ink-300">@ {r.stageName}</span>
-                {r.resolvedStageName && <span className="text-[#8B5A2B]">← 取自 {r.resolvedStageName}</span>}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
 
       <div className="overflow-x-auto rounded-xl border border-parchment-300/50">
         <table className="w-full text-sm border-collapse min-w-[560px]">
           <thead>
             <tr className="bg-parchment-100/60">
               <th className="text-left px-4 py-2.5 font-kai text-ink-400 text-xs border-b border-parchment-300/50">字根</th>
-              {groups.map(({ stage }) => (
+              {stages.map((stage) => (
                 <th key={stage.id} className="px-3 py-2.5 font-kai text-xs border-b border-parchment-300/50" style={{ color: stage.color }}>
                   {stage.name}
                 </th>
@@ -309,16 +276,19 @@ const FallbackTab: React.FC<{ pkg: ReleasePackage }> = ({ pkg }) => {
                     {e.radicalName}
                   </span>
                 </td>
-                {groups.map(({ stage, records }) => {
-                  const rec = records.find((x) => x.radicalId === e.radicalId);
-                  const st = rec?.status ?? 'missing';
+                {stages.map((stage) => {
+                  const present = byStage.get(stage.id)?.has(e.radicalId);
                   return (
                     <td key={stage.id} className="px-3 py-2 text-center border-b border-parchment-300/30">
                       <span
-                        title={rec?.resolvedStageName ? `回退自 ${rec.resolvedStageName}` : FALLBACK_STATUS[st].text}
-                        className={`inline-block px-2 py-0.5 rounded-md border text-[10px] font-kai ${FALLBACK_STATUS[st].cls}`}
+                        title="该阶段专形"
+                        className={`inline-block px-2 py-0.5 rounded-md border text-[10px] font-kai ${
+                          present
+                            ? 'bg-bronze-400/12 text-bronze-500 border-bronze-400/30'
+                            : 'bg-vermilion-500/10 text-vermilion-500 border-vermilion-500/30'
+                        }`}
                       >
-                        {FALLBACK_STATUS[st].text}
+                        {present ? '本相' : '缺形'}
                       </span>
                     </td>
                   );
@@ -349,7 +319,7 @@ const ReportTab: React.FC<{ pkg: ReleasePackage }> = ({ pkg }) => {
           <ShieldCheck size={16} />
           {report.ok ? '校验通过 · 五项硬性检查全部合格' : `校验未通过 · ${report.issues.length} 项问题`}
         </span>
-        <span className="text-[11px] text-ink-200 font-song">校验时刻 {new Date(report.checkedAt).toLocaleString('zh-CN')}</span>
+        <span className="text-[11px] text-ink-200 font-song">报告由包内快照重新生成并纳入全包校验值</span>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
@@ -393,17 +363,28 @@ const ReportTab: React.FC<{ pkg: ReleasePackage }> = ({ pkg }) => {
         </div>
       )}
 
-      <div className="mt-5 rounded-xl border border-parchment-300/50 bg-parchment-100/30 p-4">
-        <h4 className="font-kai text-sm font-bold text-ink-500 mb-2 flex items-center gap-1.5">
-          <Fingerprint size={14} className="text-vermilion-500" />
-          稳定校验值（SHA-256）
-        </h4>
-        <p className="text-[11px] font-song text-ink-300 mb-2">
-          仅由阶段、字根、词条的语义内容决定；同一份数据重复发布必然得到相同校验值，发布时刻与序号不参与计算。
-        </p>
-        <code className="block text-[11px] font-mono text-ink-400 bg-parchment-50 border border-parchment-300/50 rounded-lg p-3 break-all">
-          {pkg.checksum}
-        </code>
+      <div className="mt-5 rounded-xl border border-parchment-300/50 bg-parchment-100/30 p-4 space-y-3">
+        <div>
+          <h4 className="font-kai text-sm font-bold text-ink-500 mb-1.5 flex items-center gap-1.5">
+            <Fingerprint size={14} className="text-vermilion-500" />
+            全包校验值（SHA-256 · 验真用）
+          </h4>
+          <p className="text-[11px] font-song text-ink-300 mb-2">
+            覆盖快照、字形清单、阶段取形记录、校验报告与差异；制品内任一字段被改动，导入都会被拒绝。
+          </p>
+          <code className="block text-[11px] font-mono text-ink-400 bg-parchment-50 border border-parchment-300/50 rounded-lg p-3 break-all">
+            {pkg.checksum}
+          </code>
+        </div>
+        <div>
+          <h4 className="font-kai text-xs font-bold text-ink-400 mb-1">内容校验值（同字系判定用）</h4>
+          <p className="text-[11px] font-song text-ink-300 mb-2">
+            仅由阶段、字根、词条的语义内容决定；清空存档后同一份字系重新发布，必然得到相同结果，不受时间或历史存档影响。
+          </p>
+          <code className="block text-[11px] font-mono text-bronze-500 bg-parchment-50 border border-parchment-300/50 rounded-lg p-3 break-all">
+            {pkg.contentChecksum}
+          </code>
+        </div>
       </div>
 
       <div className="mt-4 rounded-xl border border-parchment-300/50 bg-parchment-100/30 p-4">

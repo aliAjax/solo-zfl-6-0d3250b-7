@@ -13,6 +13,9 @@ const ok = (cond, msg) => {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const errors = [];
+  // 沙箱无外网：拦截 Google 字体，避免截图等待字体加载
+  await page.route('**/fonts.googleapis.com/**', (r) => r.abort());
+  await page.route('**/fonts.gstatic.com/**', (r) => r.abort());
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('pageerror', (e) => errors.push('PAGEERROR: ' + e.message));
 
@@ -54,14 +57,15 @@ const ok = (cond, msg) => {
 
   // ── 4. 字形清单 / 回退记录 / 校验报告标签内容 ─────────────────
   console.log('[B3] 包内四个标签页');
-  await page.getByRole('button', { name: /阶段回退记录/ }).click();
-  await page.waitForSelector('text=无回退');
-  ok(true, '回退记录：满字形数据无回退');
+  await page.getByRole('button', { name: /阶段取形记录/ }).click();
+  await page.waitForSelector('text=合法包内记录全部为');
+  await page.waitForSelector('text=本相');
+  ok(true, '取形记录：全部为本相，无不可达状态');
   await page.getByRole('button', { name: /校验报告/ }).click();
   await page.waitForSelector('text=校验通过');
-  await page.waitForSelector('text=稳定校验值（SHA-256）');
+  await page.waitForSelector('text=全包校验值（SHA-256');
   ok(true, '校验报告：通过且展示校验值');
-  await page.getByRole('button', { name: /与上一包对照/ }).click();
+  await page.getByRole('button', { name: /与上一包对照/ }).first().click();
   await page.waitForSelector('text=这是第一号发布包');
   ok(true, '首包对照页提示无更早包');
   await page.getByRole('button', { name: /字形清单/ }).click();
@@ -168,10 +172,32 @@ const ok = (cond, msg) => {
   await page.waitForSelector('text=该发布包已在发布台中');
   ok(true, '重复导入被拒绝');
 
+  // 篡改导出文件后导入必须被拒（重建 + 全包校验值）
+  const fs2 = require('fs');
+  const tamperedPath = '/tmp/release-tampered.json';
+  const t = JSON.parse(fs2.readFileSync(filePath, 'utf8'));
+  t.manifest.totalRadicals = 1;
+  fs2.writeFileSync(tamperedPath, JSON.stringify(t));
+  await page.setInputFiles('input[type=file]', tamperedPath);
+  await page.waitForSelector('text=导入被拒绝');
+  ok(true, '篡改字形清单后导入被拒绝');
+
+  // 残缺路径数据无法发布
+  await page.evaluate((key) => {
+    const data = JSON.parse(localStorage.getItem(key));
+    data.state.radicals[0].baseShape = 'M10 10 L20';
+    localStorage.setItem(key, JSON.stringify(data));
+  }, STORAGE_KEY);
+  await page.goto(BASE);
+  await page.goto(BASE + '#/publish');
+  await page.waitForSelector('text=项待修');
+  ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), '残缺路径时发布按钮禁用');
+  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
+
   // ── 9. 全局控制台错误 ─────────────────────────────────────────
   console.log('[B8] 浏览器控制台错误检查');
   const interesting = errors.filter((e) =>
-    !e.includes('favicon') && !e.includes('trae') && !e.includes('speechSynthesis')
+    !e.includes('favicon') && !e.includes('trae') && !e.includes('speechSynthesis') && !e.includes('fonts.g') && !e.includes('ERR_FAILED')
   );
   ok(interesting.length === 0, `无脚本错误（${interesting.length}）${interesting[0] ? '：' + interesting[0] : ''}`);
 

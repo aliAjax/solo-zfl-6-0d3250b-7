@@ -78,7 +78,7 @@ const byOrderThenId = (
 ) => (a.order !== b.order ? a.order - b.order : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 const byNameThenId = (a: { name: string; id: string }, b: { name: string; id: string }) =>
-  a.name !== b.name ? a.name < b.name ? -1 : 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  a.name !== b.name ? (a.name < b.name ? -1 : 1) : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 
 const stripUndefined = <T extends object>(obj: T): T => {
   const out: Record<string, unknown> = {};
@@ -89,26 +89,35 @@ const stripUndefined = <T extends object>(obj: T): T => {
   return out as T;
 };
 
-// ── 路径越界检查 ────────────────────────────────────────────────────
+const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
 
-/** 每个路径命令每一轮消耗的数字个数（A 的 rx/ry/旋转/标志位不参与越界判断） */
+// ── 路径检查（严格语法 + 画框越界） ─────────────────────────────────
+
+/** 每个路径命令每一轮消耗的数字个数 */
 const COMMAND_ARGS: Record<string, number> = {
   M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7, Z: 0,
 };
 
 type PathToken = { type: 'cmd'; cmd: string } | { type: 'num'; n: number };
 
+export interface PathProblem {
+  /** bounds = 坐标越界；syntax = 空路径/未知命令/残缺参数/非法数字/非法标志位 */
+  kind: 'bounds' | 'syntax';
+  message: string;
+  x?: number;
+  y?: number;
+}
+
 /**
- * 解析 SVG path，检查每个落笔画布的坐标是否在 0–100 画框内。
- * 支持绝对/绝对命令与隐式重复；返回越界坐标描述列表；空路径也算非法。
+ * 严格解析 SVG path：
+ * - 空、含未知命令、数字残缺/非有限数、命令缺参数、A 弧标志位非 0/1 —— 一律判为非法；
+ * - 所有落笔坐标（含相对命令解析后的绝对坐标、隐式重复命令、H/V/A 终点）必须落在 0–100。
  */
-export function checkPathBounds(
-  svgPath: string
-): { x: number; y: number; raw: string }[] {
-  const violations: { x: number; y: number; raw: string }[] = [];
+export function checkPath(svgPath: string): PathProblem[] {
+  const problems: PathProblem[] = [];
   const raw = svgPath ?? '';
-  if (!raw.trim()) {
-    return [{ x: NaN, y: NaN, raw: '' }];
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return [{ kind: 'syntax', message: '路径为空' }];
   }
 
   const tokens: PathToken[] = [];
@@ -119,99 +128,139 @@ export function checkPathBounds(
     else tokens.push({ type: 'num', n: Number(tm[0]) });
   }
 
-  let cx = 0;
-  let cy = 0;
-  let sx = 0;
-  let sy = 0;
-  let i = 0;
+  // 命令之间允许空白与逗号，出现其余符号即为非法
+  const separators = raw.match(/[^a-zA-Z0-9eE+\-.\s,]/g);
+  if (separators) {
+    return [{ kind: 'syntax', message: `路径含非法字符“${separators[0]}”` }];
+  }
+  for (const t of tokens) {
+    if (t.type === 'num' && !Number.isFinite((t as { n: number }).n)) {
+      return [{ kind: 'syntax', message: '路径含非有限数字' }];
+    }
+  }
+  if (tokens.length === 0 || tokens[0].type !== 'cmd') {
+    return [{ kind: 'syntax', message: '路径必须以移动命令 M/m 开头' }];
+  }
 
   const inBounds = (v: number) => v >= -PATH_EPS && v <= PATH_BOUND + PATH_EPS;
-  const flag = (x: number, y: number) => {
+  const flagBounds = (x: number, y: number) => {
     if (!inBounds(x) || !inBounds(y)) {
-      violations.push({ x, y, raw: `${Math.round(x * 100) / 100},${Math.round(y * 100) / 100}` });
+      problems.push({
+        kind: 'bounds',
+        x,
+        y,
+        message: `坐标 (${round6(x)}, ${round6(y)}) 超出 0–${PATH_BOUND} 画框`,
+      });
     }
   };
-  const round1 = (v: number) => Math.round(v * 1e6) / 1e6;
+
+  let cx = 0;
+  let cy = 0;
+  let i = 0;
+  let started = false;
 
   while (i < tokens.length) {
     const t = tokens[i++];
-    if (t.type !== 'cmd') continue;
-    const cmd = t.cmd.toUpperCase();
-    const rel = t.cmd === t.cmd.toLowerCase() && t.cmd !== t.cmd.toUpperCase();
-    const argc = COMMAND_ARGS[cmd];
-    if (argc === undefined) continue;
+    if (t.type !== 'cmd') {
+      return [{ kind: 'syntax', message: '路径含缺少命令前缀的数字' }];
+    }
+    const upper = t.cmd.toUpperCase();
+    if (!(upper in COMMAND_ARGS)) {
+      return [{ kind: 'syntax', message: `未知路径命令“${t.cmd}”` }];
+    }
+    const rel = t.cmd !== upper;
+    const argc = COMMAND_ARGS[upper];
 
-    // 数字命令可隐式重复（如 M 后跟多对坐标）
+    // 数字命令可隐式重复（如 M 后多对坐标）；Z 不消费数字
+    let firstRound = true;
     do {
+      if (upper === 'Z') {
+        if (!firstRound) break;
+        firstRound = false;
+        break;
+      }
+      firstRound = false;
+
       const nums: number[] = [];
       while (nums.length < argc && i < tokens.length && tokens[i].type === 'num') {
         nums.push((tokens[i] as { type: 'num'; n: number }).n);
         i++;
       }
-      if (nums.length < argc) break;
+      if (nums.length < argc) {
+        return [
+          {
+            kind: 'syntax',
+            message: `命令 ${t.cmd} 参数残缺（需 ${argc} 个数字，实得 ${nums.length} 个）`,
+          },
+        ];
+      }
+      const resolve = (idx: number, cur: number) => round6(rel ? cur + nums[idx] : nums[idx]);
 
-      const resolve = (idx: number, cur: number) =>
-        rel ? round1(cur + nums[idx]) : round1(nums[idx]);
-
-      switch (cmd) {
+      switch (upper) {
         case 'M': {
+          if (!started) started = true;
           const x = resolve(0, cx);
           const y = resolve(1, cy);
-          flag(x, y);
-          cx = x; cy = y; sx = x; sy = y;
+          flagBounds(x, y);
+          cx = x; cy = y;
           break;
         }
         case 'L':
         case 'T': {
           const x = resolve(0, cx);
           const y = resolve(1, cy);
-          flag(x, y);
+          flagBounds(x, y);
           cx = x; cy = y;
           break;
         }
         case 'H': {
           const x = resolve(0, cx);
-          flag(x, cy);
+          flagBounds(x, cy);
           cx = x;
           break;
         }
         case 'V': {
           const y = resolve(0, cy);
-          flag(cx, y);
+          flagBounds(cx, y);
           cy = y;
           break;
         }
         case 'C': {
-          for (let p = 0; p < 3; p++) flag(resolve(p * 2, cx), resolve(p * 2 + 1, cy));
+          for (let p = 0; p < 3; p++) flagBounds(resolve(p * 2, cx), resolve(p * 2 + 1, cy));
           cx = resolve(4, cx); cy = resolve(5, cy);
           break;
         }
         case 'S':
         case 'Q': {
-          flag(resolve(0, cx), resolve(1, cy));
+          flagBounds(resolve(0, cx), resolve(1, cy));
           const x = resolve(2, cx);
           const y = resolve(3, cy);
-          flag(x, y);
+          flagBounds(x, y);
           cx = x; cy = y;
           break;
         }
         case 'A': {
-          // 仅终点（最后两个参数）落笔画布
+          // 两个大弧/扫描标志位必须为 0 或 1
+          if (nums[3] !== 0 && nums[3] !== 1) {
+            return [{ kind: 'syntax', message: `弧线大弧标志位非法：${nums[3]}（只允许 0 或 1）` }];
+          }
+          if (nums[4] !== 0 && nums[4] !== 1) {
+            return [{ kind: 'syntax', message: `弧线扫描标志位非法：${nums[4]}（只允许 0 或 1）` }];
+          }
           const x = resolve(5, cx);
           const y = resolve(6, cy);
-          flag(x, y);
+          flagBounds(x, y);
           cx = x; cy = y;
-          break;
-        }
-        case 'Z': {
-          cx = sx; cy = sy;
           break;
         }
       }
     } while (i < tokens.length && tokens[i].type === 'num');
   }
 
-  return violations;
+  if (!started) {
+    return [{ kind: 'syntax', message: '路径缺少移动命令 M/m' }];
+  }
+  return problems;
 }
 
 // ── 发布前校验 ──────────────────────────────────────────────────────
@@ -230,7 +279,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
   const stageIds = new Set(stages.map((s) => s.id));
   const radicalIds = new Set(radicals.map((r) => r.id));
 
-  // 1. 重名（先做，后续报告按规则顺序汇总）
+  // 1. 重名
   const dupNameIssues: ReleaseCheckIssue[] = [];
   const seenStageName = new Map<string, string>();
   const seenStageId = new Set<string>();
@@ -239,11 +288,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     const first = seenStageName.get(key);
     if (first) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'stage',
-        targetId: s.id,
-        ref: s.name,
+        code: 'duplicate-name', level: 'error', target: 'stage', targetId: s.id, ref: s.name,
         message: `阶段「${s.name}」与「${first}」重名`,
       });
     } else {
@@ -251,11 +296,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     }
     if (seenStageId.has(s.id)) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'stage',
-        targetId: s.id,
-        ref: s.id,
+        code: 'duplicate-name', level: 'error', target: 'stage', targetId: s.id, ref: s.id,
         message: `阶段 id 重复：${s.id}`,
       });
     }
@@ -269,11 +310,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     const first = seenRadicalName.get(key);
     if (first) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'radical',
-        targetId: r.id,
-        ref: r.name,
+        code: 'duplicate-name', level: 'error', target: 'radical', targetId: r.id, ref: r.name,
         message: `字根「${r.name}」与「${first}」重名`,
       });
     } else {
@@ -281,18 +318,13 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     }
     if (seenRadicalId.has(r.id)) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'radical',
-        targetId: r.id,
-        ref: r.id,
+        code: 'duplicate-name', level: 'error', target: 'radical', targetId: r.id, ref: r.id,
         message: `字根 id 重复：${r.id}`,
       });
     }
     seenRadicalId.add(r.id);
   }
 
-  // 词条重名：构件序列与读音均相同视为同一个词
   const seenLexemeKey = new Map<string, string>();
   const seenLexemeId = new Set<string>();
   for (const l of lexemes) {
@@ -301,11 +333,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     const label = `【${l.pronunciation}】${l.meaning.split('；')[0]}`;
     if (first) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'lexeme',
-        targetId: l.id,
-        ref: label,
+        code: 'duplicate-name', level: 'error', target: 'lexeme', targetId: l.id, ref: label,
         message: `词条 ${label} 与 ${first} 重复（构件、布局、读音相同）`,
       });
     } else {
@@ -313,27 +341,19 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     }
     if (seenLexemeId.has(l.id)) {
       dupNameIssues.push({
-        code: 'duplicate-name',
-        level: 'error',
-        target: 'lexeme',
-        targetId: l.id,
-        ref: l.id,
+        code: 'duplicate-name', level: 'error', target: 'lexeme', targetId: l.id, ref: l.id,
         message: `词条 id 重复：${l.id}`,
       });
     }
     seenLexemeId.add(l.id);
   }
 
-  // 同一字根在同一阶段登记多条字形
   for (const r of radicals) {
     const seen = new Set<string>();
     for (const v of r.variants) {
       if (seen.has(v.stageId)) {
         dupNameIssues.push({
-          code: 'duplicate-name',
-          level: 'error',
-          target: 'variant',
-          targetId: r.id,
+          code: 'duplicate-name', level: 'error', target: 'variant', targetId: r.id,
           ref: `${r.name}/${v.stageId}`,
           message: `字根「${r.name}」在阶段 ${v.stageId} 存在重复字形记录`,
         });
@@ -347,10 +367,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
   for (const l of lexemes) {
     if (l.radicalIds.length === 0) {
       brokenIssues.push({
-        code: 'broken-link',
-        level: 'error',
-        target: 'lexeme',
-        targetId: l.id,
+        code: 'broken-link', level: 'error', target: 'lexeme', targetId: l.id,
         ref: l.meaning.split('；')[0] || l.id,
         message: `词条「${l.meaning.split('；')[0] || l.id}」未包含任何字根`,
       });
@@ -358,11 +375,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     for (const rid of l.radicalIds) {
       if (!radicalIds.has(rid)) {
         brokenIssues.push({
-          code: 'broken-link',
-          level: 'error',
-          target: 'lexeme',
-          targetId: l.id,
-          ref: rid,
+          code: 'broken-link', level: 'error', target: 'lexeme', targetId: l.id, ref: rid,
           message: `词条「${l.meaning.split('；')[0] || l.id}」引用了不存在的字根 ${rid}`,
         });
       }
@@ -372,11 +385,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     for (const v of r.variants) {
       if (!stageIds.has(v.stageId)) {
         brokenIssues.push({
-          code: 'broken-link',
-          level: 'error',
-          target: 'variant',
-          targetId: r.id,
-          ref: v.stageId,
+          code: 'broken-link', level: 'error', target: 'variant', targetId: r.id, ref: v.stageId,
           message: `字根「${r.name}」的字形引用了不存在的阶段 ${v.stageId}`,
         });
       }
@@ -390,10 +399,7 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
     for (const s of stages) {
       if (!have.has(s.id)) {
         missingIssues.push({
-          code: 'missing-stage-glyph',
-          level: 'error',
-          target: 'radical',
-          targetId: r.id,
+          code: 'missing-stage-glyph', level: 'error', target: 'radical', targetId: r.id,
           ref: `${r.name}/${s.name}`,
           message: `字根「${r.name}」缺少阶段「${s.name}」的字形`,
         });
@@ -406,48 +412,41 @@ export function validateWritingSystem(src: ReleaseSource): ReleaseCheckIssue[] {
   for (const l of lexemes) {
     if (l.radicalIds.length > MAX_COMPONENTS) {
       componentIssues.push({
-        code: 'too-many-components',
-        level: 'error',
-        target: 'lexeme',
-        targetId: l.id,
+        code: 'too-many-components', level: 'error', target: 'lexeme', targetId: l.id,
         ref: l.meaning.split('；')[0] || l.id,
         message: `词条「${l.meaning.split('；')[0] || l.id}」包含 ${l.radicalIds.length} 个构件，超过上限 ${MAX_COMPONENTS} 个`,
       });
     }
   }
 
-  // 5. 路径越界
+  // 5. 路径越界 / 路径无效（语法错误也归入此门禁）
   const pathIssues: ReleaseCheckIssue[] = [];
-  const pushPath = (
+  const emitPath = (
     target: 'radical' | 'variant',
-    r: Pick<Radical, 'id' | 'name' | 'baseShape' | 'variants'>,
+    r: Pick<Radical, 'id' | 'name'>,
     stageName: string | null,
     svgPath: string
   ) => {
-    const violations = checkPathBounds(svgPath);
-    for (const v of violations) {
+    for (const p of checkPath(svgPath)) {
+      const where = stageName ? `在阶段「${stageName}」` : '的基础字形';
       pathIssues.push({
-        code: 'path-out-of-bounds',
-        level: 'error',
-        target,
-        targetId: r.id,
+        code: 'path-out-of-bounds', level: 'error', target, targetId: r.id,
         ref: stageName ? `${r.name}/${stageName}` : r.name,
         message:
-          v.raw === '' && Number.isNaN(v.x)
-            ? `字根「${r.name}」${stageName ? `在阶段「${stageName}」` : '的基础字形'}路径为空`
-            : `字根「${r.name}」${stageName ? `在阶段「${stageName}」` : '的基础字形'}的路径坐标 (${v.raw}) 超出 0–${PATH_BOUND} 画框`,
+          p.kind === 'syntax'
+            ? `字根「${r.name}」${where}路径无效：${p.message}`
+            : `字根「${r.name}」${where}${p.message}`,
       });
     }
   };
   for (const r of radicals) {
-    pushPath('radical', r, null, r.baseShape);
+    emitPath('radical', r, null, r.baseShape);
     for (const v of r.variants) {
       const stage = stages.find((s) => s.id === v.stageId);
-      pushPath('variant', r, stage?.name ?? v.stageId, v.svgPath);
+      emitPath('variant', r, stage?.name ?? v.stageId, v.svgPath);
     }
   }
 
-  // 按固定规则顺序汇总，保证报告确定性
   for (const code of CHECK_RULES) {
     const bucket = {
       'broken-link': brokenIssues,
@@ -521,7 +520,7 @@ function normalize(src: ReleaseSource): Normalized {
   return { stages, radicals, lexemes, stageOrder };
 }
 
-// ── 稳定序列化与校验值 ──────────────────────────────────────────────
+// ── 稳定序列化与双层校验值 ──────────────────────────────────────────
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -532,37 +531,41 @@ function stableStringify(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
 }
 
-/** 仅纳入语义内容：时间戳、序号、报告、差异均不参与校验值 */
+/** 内容投影：仅字系语义，不随时间/序号/差异/报告变化 */
 function semanticProjection(n: Normalized) {
   return {
     format: RELEASE_FORMAT,
     formatVersion: RELEASE_FORMAT_VERSION,
     stages: n.stages.map((s) => ({
-      id: s.id,
-      name: s.name,
-      order: s.order,
-      description: s.description,
-      color: s.color,
+      id: s.id, name: s.name, order: s.order, description: s.description, color: s.color,
     })),
     radicals: n.radicals.map((r) => ({
-      id: r.id,
-      name: r.name,
-      meaning: r.meaning,
-      pronunciation: r.pronunciation,
-      category: r.category,
-      baseShape: r.baseShape,
+      id: r.id, name: r.name, meaning: r.meaning, pronunciation: r.pronunciation,
+      category: r.category, baseShape: r.baseShape,
       variants: r.variants.map((v) => ({ stageId: v.stageId, svgPath: v.svgPath, note: v.note })),
     })),
     lexemes: n.lexemes.map((l) => ({
-      id: l.id,
-      radicalIds: l.radicalIds,
-      layout: l.layout,
-      pronunciation: l.pronunciation,
-      meaning: l.meaning,
-      example: l.example,
-      note: l.note,
-      writingRule: l.writingRule,
+      id: l.id, radicalIds: l.radicalIds, layout: l.layout, pronunciation: l.pronunciation,
+      meaning: l.meaning, example: l.example, note: l.note, writingRule: l.writingRule,
     })),
+  };
+}
+
+/**
+ * 制品投影：参与验真的全部内容——
+ * 快照 payload、字形清单、阶段取形记录、校验报告、与上一包差异；
+ * 只有序号不参与（导入时会重新编号）。
+ */
+function artifactProjection(p: Omit<ReleasePackage, 'checksum' | 'sequence'>) {
+  return {
+    format: p.format,
+    formatVersion: p.formatVersion,
+    contentChecksum: p.contentChecksum,
+    payload: p.payload,
+    manifest: p.manifest,
+    fallbackRecords: p.fallbackRecords,
+    report: p.report,
+    diff: p.diff,
   };
 }
 
@@ -574,34 +577,20 @@ export async function sha256Hex(text: string): Promise<string> {
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
   }
-  // 非安全上下文兜底（同步 Node 环境不会走到这里，浏览器 http(s) 与 localhost 均为安全上下文）
   throw new Error('当前环境不支持 SHA-256 摘要计算');
 }
 
+/** 内容校验值：同一字系永远相同 */
 export async function checksumForSource(src: ReleaseSource): Promise<string> {
   return sha256Hex(stableStringify(semanticProjection(normalize(src))));
 }
 
-/** 重新计算已发布包的校验值，用于导入时验真 */
-export async function checksumForPackage(pkg: ReleasePackage): Promise<string> {
-  return checksumForSource({
-    stages: pkg.payload.stages,
-    radicals: pkg.payload.radicals,
-    lexemes: pkg.payload.lexemes.map((l) => ({
-      id: l.id,
-      radicalIds: l.radicalIds,
-      layout: l.layout,
-      pronunciation: l.pronunciation,
-      meaning: l.meaning,
-      example: l.example,
-      note: l.note,
-      writingRule: l.writingRule,
-      createdAt: 0,
-    })),
-  });
+/** 全包校验值：覆盖清单/取形记录/报告/差异 */
+export async function checksumForArtifact(p: Omit<ReleasePackage, 'checksum' | 'sequence'>): Promise<string> {
+  return sha256Hex(stableStringify(artifactProjection(p)));
 }
 
-// ── 字形清单与阶段回退记录 ──────────────────────────────────────────
+// ── 字形清单与阶段取形记录 ──────────────────────────────────────────
 
 function buildManifest(n: Normalized): ReleasePackage['manifest'] {
   const entries: GlyphManifestEntry[] = n.radicals.map((r) => {
@@ -625,50 +614,37 @@ function buildManifest(n: Normalized): ReleasePackage['manifest'] {
   };
 }
 
+/**
+ * 阶段取形记录。
+ * 门禁保证每个字根×每个阶段都有专形；这里只生成 exact 记录，
+ * 若与门禁不一致则直接抛出（防御性，正常流程不可达）。
+ */
 function buildFallbackRecords(n: Normalized): StageFallbackEntry[] {
   const records: StageFallbackEntry[] = [];
   for (const s of n.stages) {
-    const order = n.stageOrder.get(s.id) ?? 0;
     for (const r of n.radicals) {
-      const exact = r.variants.find((v) => v.stageId === s.id);
-      let entry: StageFallbackEntry;
-      if (exact) {
-        entry = { radicalId: r.id, radicalName: r.name, stageId: s.id, stageName: s.name, status: 'exact' };
-      } else {
-        // 回退到更早的最近阶段字形
-        const earlier = n.stages
-          .filter((es) => (n.stageOrder.get(es.id) ?? 0) < order)
-          .reverse()
-          .map((es) => ({ es, v: r.variants.find((v) => v.stageId === es.id) }))
-          .find((x) => x.v);
-        if (earlier?.v) {
-          entry = {
-            radicalId: r.id,
-            radicalName: r.name,
-            stageId: s.id,
-            stageName: s.name,
-            status: 'fallback',
-            resolvedStageId: earlier.es.id,
-            resolvedStageName: earlier.es.name,
-          };
-        } else if (r.baseShape.trim()) {
-          entry = { radicalId: r.id, radicalName: r.name, stageId: s.id, stageName: s.name, status: 'base' };
-        } else {
-          entry = { radicalId: r.id, radicalName: r.name, stageId: s.id, stageName: s.name, status: 'missing' };
-        }
+      if (!r.variants.some((v) => v.stageId === s.id)) {
+        throw new ReleaseValidationError([
+          {
+            code: 'missing-stage-glyph', level: 'error', target: 'radical', targetId: r.id,
+            ref: `${r.name}/${s.name}`,
+            message: `字根「${r.name}」缺少阶段「${s.name}」的字形（取形记录与门禁不一致）`,
+          },
+        ]);
       }
-      records.push(entry);
+      records.push({
+        radicalId: r.id, radicalName: r.name, stageId: s.id, stageName: s.name, status: 'exact',
+      });
     }
   }
   return records;
 }
 
-function buildReport(n: Normalized, issues: ReleaseCheckIssue[], now: string): ReleaseCheckReport {
+function buildReport(n: Normalized, issues: ReleaseCheckIssue[]): ReleaseCheckReport {
   const counts = Object.fromEntries(CHECK_RULES.map((c) => [c, 0])) as Record<ReleaseCheckCode, number>;
   for (const i of issues) counts[i.code]++;
   return {
     ok: issues.length === 0,
-    checkedAt: now,
     rules: [...CHECK_RULES],
     counts,
     issues,
@@ -685,8 +661,9 @@ function buildReport(n: Normalized, issues: ReleaseCheckIssue[], now: string): R
 
 function radicalShapeSignature(r: RadicalSnapshot): string {
   const parts = [r.baseShape];
-  const byStage = new Map(r.variants.map((v) => [v.stageId, v.svgPath]));
-  for (const [sid, path] of [...byStage.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+  for (const [sid, path] of [...r.variants.map((v) => [v.stageId, v.svgPath] as [string, string])].sort(([a], [b]) =>
+    a < b ? -1 : 1
+  )) {
     parts.push(`${sid}=${path}`);
   }
   return parts.join('|');
@@ -768,7 +745,6 @@ export function diffPackages(prev: ReleasePackage | null, next: ReleasePackage):
     ...diff.lexemes.removed,
     ...diff.lexemes.changed,
   ]);
-  // 字根增删改波及引用它的既有词条
   const touchedRadicals = new Set<string>([
     ...diff.radicals.added,
     ...diff.radicals.removed,
@@ -791,25 +767,20 @@ export function diffPackages(prev: ReleasePackage | null, next: ReleasePackage):
   diff.affectedLexemes = [...affectedLex].sort();
   diff.affectedRadicals = [...affectedRad].sort();
   diff.unchanged =
-    prev.checksum === next.checksum &&
+    next.contentChecksum === prev.contentChecksum &&
     diff.stages.added.length + diff.stages.removed.length + diff.stages.changed.length === 0 &&
     diff.radicals.added.length + diff.radicals.removed.length + diff.radicals.changed.length === 0 &&
     diff.lexemes.added.length + diff.lexemes.removed.length + diff.lexemes.changed.length === 0;
   return diff;
 }
 
-// ── 构建发布包 ──────────────────────────────────────────────────────
+// ── 构建发布包（制品是数据的纯函数：无时间、无随机、无存档依赖） ─────
 
 export interface BuildReleaseOptions {
   sequence: number;
   prev: ReleasePackage | null;
-  now: string;
 }
 
-/**
- * 编译只读发布包。
- * 任一硬性检查失败即抛出 ReleaseValidationError —— 调用方不得改动当前数据与旧包。
- */
 export async function buildReleasePackage(
   src: ReleaseSource,
   opts: BuildReleaseOptions
@@ -818,29 +789,28 @@ export async function buildReleasePackage(
   if (issues.length > 0) throw new ReleaseValidationError(issues);
 
   const n = normalize(src);
-  const checksum = await sha256Hex(stableStringify(semanticProjection(n)));
+  const contentChecksum = await sha256Hex(stableStringify(semanticProjection(n)));
 
-  const base: ReleasePackage = {
+  // 组装占位草稿（checksum 不参与 artifactProjection，先留空）
+  const draft: ReleasePackage = {
     format: RELEASE_FORMAT,
     formatVersion: RELEASE_FORMAT_VERSION,
     sequence: opts.sequence,
-    publishedAt: opts.now,
-    checksum,
-    payload: {
-      stages: n.stages,
-      radicals: n.radicals,
-      lexemes: n.lexemes,
-    },
+    contentChecksum,
+    payload: { stages: n.stages, radicals: n.radicals, lexemes: n.lexemes },
     manifest: buildManifest(n),
     fallbackRecords: buildFallbackRecords(n),
-    report: buildReport(n, issues, opts.now),
+    report: buildReport(n, issues),
     diff: null,
+    checksum: '',
   };
-  base.diff = opts.prev ? diffPackages(opts.prev, base) : null;
-  return base;
+  draft.diff = opts.prev ? diffPackages(opts.prev, draft) : null;
+  const checksum = await checksumForArtifact(draft);
+
+  return { ...draft, checksum };
 }
 
-// ── 发布包解析与验真 ────────────────────────────────────────────────
+// ── 发布包解析、重建与验真 ──────────────────────────────────────────
 
 export class ReleaseParseError extends Error {
   constructor(message: string) {
@@ -849,8 +819,16 @@ export class ReleaseParseError extends Error {
   }
 }
 
-/** 解析并校验发布包文件（结构 + 稳定校验值） */
-export async function parseReleasePackage(json: string): Promise<ReleasePackage> {
+export interface ParseContext {
+  /** 本地存档中可能存在的差异基准包；命中 diff.fromChecksum 时会逐字节复算差异 */
+  prev?: ReleasePackage | null;
+}
+
+/**
+ * 由包内快照重建规范制品，再与文件逐字段比对，并复核全包校验值。
+ * 任一派生字段（清单/取形记录/报告/差异）或快照本身被改动都会拒绝。
+ */
+export async function parseReleasePackage(json: string, context?: ParseContext): Promise<ReleasePackage> {
   let raw: unknown;
   try {
     raw = JSON.parse(json);
@@ -858,14 +836,18 @@ export async function parseReleasePackage(json: string): Promise<ReleasePackage>
     throw new ReleaseParseError('不是有效的 JSON 文件');
   }
   const pkg = raw as Partial<ReleasePackage>;
-  if (!pkg || pkg.format !== RELEASE_FORMAT) {
+  if (!pkg || typeof pkg !== 'object') throw new ReleaseParseError('发布包结构为空');
+  if (pkg.format !== RELEASE_FORMAT) {
     throw new ReleaseParseError('文件头标识不符，不是字形演化发布包');
   }
   if (pkg.formatVersion !== RELEASE_FORMAT_VERSION) {
     throw new ReleaseParseError(`不支持的发布包版本：${String(pkg.formatVersion)}`);
   }
-  if (!pkg.checksum || typeof pkg.checksum !== 'string') {
-    throw new ReleaseParseError('发布包缺少稳定校验值');
+  if (typeof pkg.checksum !== 'string' || !/^[0-9a-f]{64}$/.test(pkg.checksum)) {
+    throw new ReleaseParseError('发布包缺少有效的全包校验值');
+  }
+  if (typeof pkg.contentChecksum !== 'string' || !/^[0-9a-f]{64}$/.test(pkg.contentChecksum)) {
+    throw new ReleaseParseError('发布包缺少有效的内容校验值');
   }
   if (!pkg.payload || !Array.isArray(pkg.payload.stages) || !Array.isArray(pkg.payload.radicals) || !Array.isArray(pkg.payload.lexemes)) {
     throw new ReleaseParseError('发布包快照数据不完整');
@@ -874,15 +856,162 @@ export async function parseReleasePackage(json: string): Promise<ReleasePackage>
     throw new ReleaseParseError('发布包缺少字形清单');
   }
   if (!Array.isArray(pkg.fallbackRecords)) {
-    throw new ReleaseParseError('发布包缺少阶段回退记录');
+    throw new ReleaseParseError('发布包缺少阶段取形记录');
   }
-  if (!pkg.report) {
+  if (!pkg.report || typeof pkg.report !== 'object') {
     throw new ReleaseParseError('发布包缺少校验报告');
   }
-  const actual = await checksumForPackage(pkg as ReleasePackage);
-  if (actual !== pkg.checksum) {
-    throw new ReleaseParseError('稳定校验值不一致：发布包内容可能已被篡改或损坏');
+  if (!('diff' in pkg)) {
+    throw new ReleaseParseError('发布包缺少差异字段');
   }
+  if (pkg.diff !== null && typeof pkg.diff !== 'object') {
+    throw new ReleaseParseError('发布包差异字段已损坏');
+  }
+  // 封皮时间戳等游离字段不应出现在制品中
+  const ALLOWED_KEYS = [
+    'format', 'formatVersion', 'sequence', 'checksum', 'contentChecksum',
+    'payload', 'manifest', 'fallbackRecords', 'report', 'diff',
+  ];
+  for (const k of Object.keys(pkg)) {
+    if (!ALLOWED_KEYS.includes(k)) {
+      throw new ReleaseParseError(`发布包含有不受校验的多余字段：${k}`);
+    }
+  }
+
+  // 1) 包内快照本身必须通过当前发布门禁（残缺/越界路径在此被拦）
+  const source: ReleaseSource = {
+    stages: pkg.payload.stages as StageSnapshot[],
+    radicals: pkg.payload.radicals as RadicalSnapshot[],
+    lexemes: pkg.payload.lexemes.map((l) => ({
+      id: l.id,
+      radicalIds: l.radicalIds,
+      layout: l.layout,
+      pronunciation: l.pronunciation,
+      meaning: l.meaning,
+      example: l.example,
+      note: l.note,
+      writingRule: l.writingRule,
+    })),
+  };
+  const gate = validateWritingSystem(source);
+  if (gate.length > 0) {
+    throw new ReleaseParseError(`发布包未通过发布门禁：${gate[0].message}`);
+  }
+
+  // 2) 由快照重建规范制品（序号与上一包引用以文件为准，不参与重建比对）
+  const rebuilt = await buildReleasePackage(source, {
+    sequence: typeof pkg.sequence === 'number' ? pkg.sequence : 0,
+    prev: null,
+  });
+
+  const compare = (label: string, a: unknown, b: unknown) => {
+    const sa = stableStringify(a);
+    const sb = stableStringify(b);
+    if (sa !== sb) {
+      throw new ReleaseParseError(`发布包${label}与重建结果不一致，制品可能已被改动`);
+    }
+  };
+  compare('的内容校验值', pkg.contentChecksum, rebuilt.contentChecksum);
+  compare('快照', pkg.payload, rebuilt.payload);
+  compare('的字形清单', pkg.manifest, rebuilt.manifest);
+  compare('的阶段取形记录', pkg.fallbackRecords, rebuilt.fallbackRecords);
+
+  // 报告：文件中的报告必须等于「对该快照重新校验」的报告
+  compare('的校验报告', pkg.report, rebuilt.report);
+
+  // 差异：校验结构完整；其字节已被全包校验值覆盖，篡改即导致校验值不符
+  if (pkg.diff === null) {
+    if (rebuilt.diff !== null) throw new ReleaseParseError('发布包差异字段与重建结果不一致');
+  } else {
+    const d = pkg.diff;
+    for (const key of ['stages', 'radicals', 'lexemes'] as const) {
+      const sec = d[key] as unknown;
+      if (!sec || typeof sec !== 'object') throw new ReleaseParseError(`发布包差异.${key} 已损坏`);
+      for (const k of ['added', 'removed', 'changed'] as const) {
+        const arr = (sec as Record<string, unknown>)[k];
+        if (!Array.isArray(arr) || !arr.every((x) => typeof x === 'string')) {
+          throw new ReleaseParseError(`发布包差异.${key}.${k} 已损坏`);
+        }
+      }
+    }
+    for (const k of ['layout', 'paths', 'affectedRadicals', 'affectedLexemes'] as const) {
+      const arr = d[k] as unknown;
+      if (!Array.isArray(arr) || !arr.every((x) => typeof x === 'string')) {
+        throw new ReleaseParseError(`发布包差异.${k} 已损坏`);
+      }
+    }
+    if (
+      typeof d.unchanged !== 'boolean' ||
+      (d.fromChecksum !== null && typeof d.fromChecksum !== 'string') ||
+      (d.fromSequence !== null && typeof d.fromSequence !== 'number')
+    ) {
+      throw new ReleaseParseError('发布包差异头部已损坏');
+    }
+
+    // 内部一致性：新增/修改项必须存在于本包，删除项必须不在本包；
+    // unchanged=true 时所有增删改必须为空。
+    const stageIds = new Set(pkg.payload.stages.map((s) => s.id));
+    const radicalIds = new Set(pkg.payload.radicals.map((r) => r.id));
+    const lexemeIds = new Set(pkg.payload.lexemes.map((l) => l.id));
+    const checkSection = (
+      label: string,
+      sec: { added: string[]; removed: string[]; changed: string[] },
+      ids: Set<string>
+    ) => {
+      for (const id of sec.added) if (!ids.has(id)) throw new ReleaseParseError(`差异.${label}.added 引用了包内不存在的对象 ${id}`);
+      for (const id of sec.changed) if (!ids.has(id)) throw new ReleaseParseError(`差异.${label}.changed 引用了包内不存在的对象 ${id}`);
+      for (const id of sec.removed) if (ids.has(id)) throw new ReleaseParseError(`差异.${label}.removed 与包内快照矛盾（对象仍存在）${id}`);
+    };
+    checkSection('stages', d.stages, stageIds);
+    checkSection('radicals', d.radicals, radicalIds);
+    checkSection('lexemes', d.lexemes, lexemeIds);
+    for (const id of d.layout) if (!lexemeIds.has(id)) throw new ReleaseParseError(`差异.layout 引用了包内不存在的词条 ${id}`);
+    for (const id of d.paths) if (!radicalIds.has(id)) throw new ReleaseParseError(`差异.paths 引用了包内不存在的字根 ${id}`);
+    for (const id of d.affectedRadicals) {
+      if (!radicalIds.has(id) && !d.radicals.removed.includes(id)) {
+        throw new ReleaseParseError(`差异.affectedRadicals 引用无法解释：${id}`);
+      }
+    }
+    for (const id of d.affectedLexemes) {
+      if (!lexemeIds.has(id) && !d.lexemes.removed.includes(id)) {
+        throw new ReleaseParseError(`差异.affectedLexemes 引用无法解释：${id}`);
+      }
+    }
+    if (d.unchanged) {
+      const total =
+        d.stages.added.length + d.stages.removed.length + d.stages.changed.length +
+        d.radicals.added.length + d.radicals.removed.length + d.radicals.changed.length +
+        d.lexemes.added.length + d.lexemes.removed.length + d.lexemes.changed.length;
+      if (total !== 0 || d.layout.length !== 0 || d.paths.length !== 0) {
+        throw new ReleaseParseError('差异声称无变化，却列出了增删改条目');
+      }
+    }
+
+    // 若本地正好存有差异基准包，则按两端快照重建差异并逐字节比对
+    const basis = context?.prev ?? null;
+    if (basis && d.fromChecksum === basis.checksum) {
+      const rebuiltDiff = diffPackages(basis, pkg as ReleasePackage);
+      if (stableStringify(rebuiltDiff) !== stableStringify(d)) {
+        throw new ReleaseParseError('发布包差异与两端快照重建结果不一致');
+      }
+    }
+  }
+
+  // 3) 全包校验值：对除 sequence/checksum 外的全部字段复算
+  const expectedChecksum = await checksumForArtifact({
+    format: pkg.format,
+    formatVersion: pkg.formatVersion,
+    contentChecksum: pkg.contentChecksum,
+    payload: pkg.payload,
+    manifest: pkg.manifest,
+    fallbackRecords: pkg.fallbackRecords,
+    report: pkg.report,
+    diff: pkg.diff,
+  });
+  if (expectedChecksum !== pkg.checksum) {
+    throw new ReleaseParseError('全包校验值不一致：制品内容可能已被篡改或损坏');
+  }
+
   return pkg as ReleasePackage;
 }
 
@@ -904,14 +1033,25 @@ export function releaseLexemeLabel(pkg: ReleasePackage, id: string): string {
 }
 
 /** 优先在新包中取名，找不到再查旧包 */
-export function nameAcross(next: ReleasePackage, prev: ReleasePackage | null, kind: 'radical' | 'stage' | 'lexeme', id: string): string {
+export function nameAcross(
+  next: ReleasePackage,
+  prev: ReleasePackage | null,
+  kind: 'radical' | 'stage' | 'lexeme',
+  id: string
+): string {
   if (kind === 'radical') {
-    return next.payload.radicals.find((r) => r.id === id)?.name ??
-      prev?.payload.radicals.find((r) => r.id === id)?.name ?? id;
+    return (
+      next.payload.radicals.find((r) => r.id === id)?.name ??
+      prev?.payload.radicals.find((r) => r.id === id)?.name ??
+      id
+    );
   }
   if (kind === 'stage') {
-    return next.payload.stages.find((s) => s.id === id)?.name ??
-      prev?.payload.stages.find((s) => s.id === id)?.name ?? id;
+    return (
+      next.payload.stages.find((s) => s.id === id)?.name ??
+      prev?.payload.stages.find((s) => s.id === id)?.name ??
+      id
+    );
   }
   const l = next.payload.lexemes.find((x) => x.id === id) ?? prev?.payload.lexemes.find((x) => x.id === id);
   return l ? `${l.pronunciation}【${l.radicalNames.join('')}】` : id;

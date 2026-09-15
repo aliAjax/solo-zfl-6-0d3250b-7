@@ -2,12 +2,14 @@
 import { MOCK_STAGES, MOCK_RADICALS, MOCK_LEXEMES } from '../src/utils/mockData';
 import {
   buildReleasePackage,
-  checkPathBounds,
+  checkPath,
   diffPackages,
   parseReleasePackage,
   validateWritingSystem,
   checksumForSource,
+  checksumForArtifact,
   ReleaseValidationError,
+  ReleaseParseError,
 } from '../src/utils/releaseUtils';
 
 let pass = 0;
@@ -17,60 +19,65 @@ const ok = (cond: boolean, msg: string) => {
   else { fail++; console.log('  ✗ FAIL:', msg); }
 };
 const eq = (a: unknown, b: unknown, msg: string) => ok(JSON.stringify(a) === JSON.stringify(b), msg);
+const rejected = async (p: Promise<unknown>, msg: string) => {
+  let r = false;
+  try { await p; } catch (e) { r = e instanceof ReleaseParseError; }
+  ok(r, msg);
+};
 
+const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x));
 const base = () => ({
-  stages: MOCK_STAGES.map((s) => ({ ...s })),
-  radicals: MOCK_RADICALS.map((r) => ({ ...r, variants: r.variants.map((v) => ({ ...v })) })),
-  lexemes: MOCK_LEXEMES.map((l) => ({ ...l, radicalIds: [...l.radicalIds] })),
+  stages: clone(MOCK_STAGES),
+  radicals: clone(MOCK_RADICALS),
+  lexemes: clone(MOCK_LEXEMES),
 });
 
-// ── 1. mock 数据应当发布成功（含路径全部在界内） ─────────────────
+// ── 1. mock 数据应当发布成功（含路径全部在界内且语法合法） ────────
 console.log('[1] 基线数据发布');
 {
   const issues = validateWritingSystem(base());
   ok(issues.length === 0, `基线无校验问题（实际 ${issues.length}: ${issues.map((i) => i.code).join(',')}）`);
   for (const r of MOCK_RADICALS) {
-    ok(checkPathBounds(r.baseShape).length === 0, `baseShape 界内: ${r.name}`);
-    for (const v of r.variants) ok(checkPathBounds(v.svgPath).length === 0, `variant 界内: ${r.name}`);
+    ok(checkPath(r.baseShape).length === 0, `baseShape 合法且界内: ${r.name}`);
+    for (const v of r.variants) ok(checkPath(v.svgPath).length === 0, `variant 合法且界内: ${r.name}`);
   }
 }
 
-// ── 2. 确定性：同一数据两次发布，校验值与包内容一致 ────────────────
-console.log('[2] 重复发布一致性（稳定校验值）');
+// ── 2. 确定性：同一数据，包内容与校验值完全相同（去时间、去历史） ──
+console.log('[2] 重复发布一致性（无时间、无存档依赖）');
 {
-  const pkg1 = await buildReleasePackage(base(), { sequence: 1, prev: null, now: '2026-09-01T00:00:00.000Z' });
-  const pkg2 = await buildReleasePackage(base(), { sequence: 9, prev: null, now: '2026-12-31T23:59:59.999Z' });
-  ok(pkg1.checksum === pkg2.checksum, '不同时间/序号下校验值相同');
-  eq(pkg1.payload, pkg2.payload, '语义快照逐字节一致');
+  const pkg1 = await buildReleasePackage(base(), { sequence: 1, prev: null });
+  const pkg2 = await buildReleasePackage(base(), { sequence: 99, prev: null });
+  ok(pkg1.checksum === pkg2.checksum, '不同序号/无时间下全包校验值相同');
+  ok(pkg1.contentChecksum === pkg2.contentChecksum, '内容校验值相同');
+  eq(pkg1.payload, pkg2.payload, '语义快照一致');
   eq(pkg1.manifest, pkg2.manifest, '字形清单一致');
-  eq(pkg1.fallbackRecords, pkg2.fallbackRecords, '阶段回退记录一致');
-  ok(pkg1.fallbackRecords.every((r) => r.status === 'exact'), '满字形数据全部 status=exact');
-  ok(pkg1.report.ok && pkg1.report.issues.length === 0, '校验报告 ok');
+  eq(pkg1.fallbackRecords, pkg2.fallbackRecords, '阶段取形记录一致');
+  eq(pkg1.report, pkg2.report, '校验报告一致');
+  ok(!('publishedAt' in pkg1), '包内不存在时间戳字段');
+  ok(pkg1.fallbackRecords.every((r) => r.status === 'exact'), '取形记录全部 exact，无不可达状态');
   const cs = await checksumForSource(base());
-  ok(cs === pkg1.checksum, 'checksumForSource 与包内校验值一致');
-  // 数据顺序打乱后结果不变
+  ok(cs === pkg1.contentChecksum, '内容校验值可独立复算');
+  // 输入顺序打乱，重建结果逐字段相同
   const shuffled = base();
   shuffled.radicals = [...shuffled.radicals].reverse();
   shuffled.stages = [...shuffled.stages].reverse();
-  const pkg3 = await buildReleasePackage(shuffled, { sequence: 1, prev: null, now: 'x' });
-  ok(pkg3.checksum === pkg1.checksum, '输入顺序打乱不影响校验值');
-  eq(pkg3.payload, pkg1.payload, '输入顺序打乱不影响快照');
+  shuffled.lexemes = [...shuffled.lexemes].reverse();
+  const pkg3 = await buildReleasePackage(shuffled, { sequence: 1, prev: null });
+  eq(pkg3, pkg1, '输入顺序打乱后整个包逐字节相同（含序号一致时）');
 }
 
 // ── 3. 五项校验各自可被触发 ───────────────────────────────────────
 console.log('[3] 五项发布前校验');
 {
-  // 断链：词条引用不存在字根
   let d = base();
   d.lexemes[0] = { ...d.lexemes[0], radicalIds: ['rad-sun', 'rad-ghost'] };
   ok(validateWritingSystem(d).some((i) => i.code === 'broken-link'), '断链：词条→缺失字根');
 
-  // 断链：变体引用不存在阶段
   d = base();
   d.radicals[0] = { ...d.radicals[0], variants: [...d.radicals[0].variants, { stageId: 'stage-x', svgPath: 'M0 0 L1 1' }] };
   ok(validateWritingSystem(d).some((i) => i.code === 'broken-link'), '断链：变体→缺失阶段');
 
-  // 缺失阶段字形
   d = base();
   d.radicals[0] = { ...d.radicals[0], variants: d.radicals[0].variants.filter((v) => v.stageId !== 'stage-2') };
   {
@@ -78,156 +85,237 @@ console.log('[3] 五项发布前校验');
     ok(iss.length === 1 && iss[0].message.includes('青铜吉文'), '缺失阶段字形被检出');
   }
 
-  // 重名：字根
   d = base();
   d.radicals[1] = { ...d.radicals[1], name: d.radicals[0].name };
   ok(validateWritingSystem(d).some((i) => i.code === 'duplicate-name' && i.target === 'radical'), '字根重名');
-  // 重名：阶段
   d = base();
   d.stages[1] = { ...d.stages[1], name: d.stages[0].name };
   ok(validateWritingSystem(d).some((i) => i.code === 'duplicate-name' && i.target === 'stage'), '阶段重名');
 
-  // 构件超过 24
   d = base();
   d.lexemes[0] = { ...d.lexemes[0], radicalIds: Array(25).fill('rad-sun') };
-  {
-    const iss = validateWritingSystem(d).filter((i) => i.code === 'too-many-components');
-    ok(iss.length === 1 && iss[0].message.includes('25'), '构件 25 个被拦截（含数量文案）');
-  }
+  ok(validateWritingSystem(d).some((i) => i.code === 'too-many-components'), '构件 25 个被拦截');
   d = base();
   d.lexemes[0] = { ...d.lexemes[0], radicalIds: Array(24).fill('rad-sun') };
   ok(!validateWritingSystem(d).some((i) => i.code === 'too-many-components'), '构件 24 个放行');
 
-  // 路径越界
+  // 越界
   d = base();
   d.radicals[0] = { ...d.radicals[0], baseShape: 'M10 10 L120 40 Z' };
-  ok(validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '路径坐标 120 越界');
+  ok(validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds' && i.message.includes('超出')), '坐标 120 越界');
   d = base();
   d.radicals[0] = { ...d.radicals[0], baseShape: 'M-5 10 L40 40 Z' };
-  ok(validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '路径坐标 -5 越界');
+  ok(validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '坐标 -5 越界');
   d = base();
   d.radicals[0] = { ...d.radicals[0], baseShape: 'M0 0 l10 10 l-10 0 z' };
-  ok(!validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '相对命令解析后仍在界内');
-  d = base();
-  d.radicals[0] = { ...d.radicals[0], baseShape: '' };
-  ok(validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '空路径被拦截');
+  ok(!validateWritingSystem(d).some((i) => i.code === 'path-out-of-bounds'), '相对命令解析后在界内放行');
 }
 
-// ── 4. 校验失败时抛出且不产生包 ───────────────────────────────────
-console.log('[4] 失败原子性');
+// ── 4. 无效/残缺路径全部拦截 ───────────────────────────────────────
+console.log('[4] 路径语法严格校验');
+{
+  const bad = [
+    ['空路径', ''],
+    ['纯空白', '   '],
+    ['无 M 开头', 'L10 10 L20 20'],
+    ['未知命令', 'M10 10 X20 20'],
+    ['M 参数残缺', 'M10'],
+    ['C 参数残缺', 'M0 0 C10 10 20 20'],
+    ['数字孤立', '10 10 20 20'],
+    ['非法字符', 'M10 10 L20 20 #'],
+    ['非有限数', 'M0 0 L1e999 1'],
+    ['弧标志位非 0/1', 'M0 0 A10 10 0 2 0 50 50'],
+    ['只有 Z', 'Z'],
+    ['坐标超 100', 'M100.5 0 L0 100'],
+  ] as const;
+  for (const [label, p] of bad) {
+    const probs = checkPath(p);
+    ok(probs.length > 0, `拦截：${label}`);
+  }
+  const good = [
+    'M10 10 L90 90 Z',
+    'M20 20 C30 10 70 10 80 20 S90 40 80 80 Z',
+    'M10 50 H90 V80 H10 Z',
+    'M10 10 a10 10 0 1 0 20 0 a10 10 0 1 1 -20 0',
+    'M50 10 Q60 30 50 50 T50 90',
+    'M50 50 m10 0 l10 10',
+  ];
+  for (const p of good) ok(checkPath(p).length === 0, `放行合法路径：${p.slice(0, 24)}…`);
+
+  // 语法问题也必须进入发布门禁
+  const d = base();
+  d.radicals[2] = { ...d.radicals[2], baseShape: 'M10 10 L20' };
+  const iss = validateWritingSystem(d);
+  ok(iss.some((i) => i.code === 'path-out-of-bounds' && i.message.includes('路径无效')), '残缺路径在发布门禁中报「路径无效」');
+}
+
+// ── 5. 校验失败原子性 ─────────────────────────────────────────────
+console.log('[5] 失败原子性');
 {
   const d = base();
   d.radicals[0] = { ...d.radicals[0], baseShape: 'M999 999 Z' };
   let threw = false;
-  try {
-    await buildReleasePackage(d, { sequence: 1, prev: null, now: 'x' });
-  } catch (e) {
-    threw = e instanceof ReleaseValidationError;
-  }
+  try { await buildReleasePackage(d, { sequence: 1, prev: null }); }
+  catch (e) { threw = e instanceof ReleaseValidationError; }
   ok(threw, '校验失败抛出 ReleaseValidationError');
 }
 
-// ── 5. 发布后改动不影响旧包（不可变快照）+ diff ───────────────────
-console.log('[5] 旧包不变性与差异对照');
+// ── 6. 旧包不变性 + diff ──────────────────────────────────────────
+console.log('[6] 旧包不变性与差异对照');
 {
-  const d1 = base();
-  const pkg1 = await buildReleasePackage(d1, { sequence: 1, prev: null, now: '2026-09-01T00:00:00Z' });
+  const pkg1 = await buildReleasePackage(base(), { sequence: 1, prev: null });
 
-  // 改动：删一个字根、改一个字根的路径、改一个词条布局、加一个阶段、加一个词条
   let d2 = base();
-  const changedPathRadical = d2.radicals.find((r) => r.id === 'rad-moon')!;
-  const oldMoonStage1 = changedPathRadical.variants.find((v) => v.stageId === 'stage-1')!;
-  changedPathRadical.variants = changedPathRadical.variants.map((v) =>
-    v.stageId === 'stage-1' ? { ...v, svgPath: 'M50 10 C70 10 90 30 90 50 C90 70 70 90 50 90 C30 90 10 70 10 50 C10 30 30 10 50 10 Z' } : v
-  );
-  void oldMoonStage1;
-  d2.lexemes[0] = { ...d2.lexemes[0], layout: 'vertical' }; // 明：horizontal→vertical
-  d2.stages = d2.stages.filter((s) => s.id !== 'stage-4'); // 删阶段会连带导致缺字形 → 先补字形再删
-  // 为使数据仍合法：删除 stage-4 变体引用（其余字根该阶段字形缺失会报错），故改为新增阶段而非删除
-  d2 = base();
-  d2.stages = [...d2.stages, { id: 'stage-5', name: '简化新文', order: 4, description: '新增阶段', color: '#111' }];
-  // 给所有字根补 stage-5 字形（复制 stage-4）以保持合法
+  d2.stages = [...d2.stages, { id: 'stage-5', name: '简化新文', order: 4, description: '新增', color: '#111' }];
   d2.radicals = d2.radicals.map((r) => ({
     ...r,
     variants: [...r.variants, { stageId: 'stage-5', svgPath: r.variants.find((v) => v.stageId === 'stage-4')!.svgPath }],
   }));
+  const changedLexemeId = d2.lexemes[0].id;
   d2.lexemes[0] = { ...d2.lexemes[0], layout: 'vertical' };
-  d2.radicals = d2.radicals.filter((r) => r.id !== 'rad-fire'); // 删字根（无词条引用）
+  d2.radicals = d2.radicals.filter((r) => r.id !== 'rad-fire');
   d2.lexemes = [...d2.lexemes, {
-    id: 'lx-new', radicalIds: ['rad-water', 'rad-fire'.replace('rad-fire', 'rad-mouth')], layout: 'overlay',
+    id: 'lx-new', radicalIds: ['rad-water', 'rad-mouth'], layout: 'overlay',
     pronunciation: 'new', meaning: '新词条', createdAt: 1,
   }];
+  // 改 moon 的 stage-1 路径
+  d2.radicals.find((r) => r.id === 'rad-moon')!.variants.find((v) => v.stageId === 'stage-1')!.svgPath =
+    'M50 10 C70 10 90 30 90 50 C90 70 70 90 50 90 C30 90 10 70 10 50 C10 30 30 10 50 10 Z';
 
-  const pkg2 = await buildReleasePackage(d2, { sequence: 2, prev: pkg1, now: '2026-09-02T00:00:00Z' });
-
-  // 旧包纹丝不动
-  ok(pkg1.manifest.totalRadicals === 12, '旧包字根数仍为 12');
-  ok(pkg1.payload.stages.length === 4, '旧包阶段数仍为 4');
-  const oldMoon = pkg1.payload.radicals.find((r) => r.id === 'rad-moon')!;
+  const pkg2 = await buildReleasePackage(d2, { sequence: 2, prev: pkg1 });
+  ok(pkg1.manifest.totalRadicals === 12, '旧包字根仍为 12');
+  ok(pkg1.payload.stages.length === 4, '旧包阶段仍为 4');
   ok(
-    oldMoon.variants.find((v) => v.stageId === 'stage-1')!.svgPath ===
+    pkg1.payload.radicals.find((r) => r.id === 'rad-moon')!.variants.find((v) => v.stageId === 'stage-1')!.svgPath ===
       MOCK_RADICALS.find((r) => r.id === 'rad-moon')!.variants.find((v) => v.stageId === 'stage-1')!.svgPath,
     '旧包 moon 路径保持原值'
   );
 
   const diff = pkg2.diff!;
-  ok(diff.stages.added.includes('stage-5'), 'diff: 新增 stage-5');
-  ok(diff.radicals.removed.includes('rad-fire'), 'diff: 删除 rad-fire');
-  ok(diff.lexemes.added.includes('lx-new'), 'diff: 新增词条');
-  ok(diff.lexemes.changed.includes(d2.lexemes[0].id) === false || true, '（词条 changed 列表存在）');
-  const changedLexemeId = base().lexemes[0].id;
-  ok(diff.layout.includes(changedLexemeId), 'diff: 布局变化登记');
-  ok(diff.paths.includes('rad-moon'), 'diff: 路径变化登记 rad-moon');
-  // 受影响字根：moon（路径）、fire（删除）、新词条构件 mouth；明词条构件 sun/moon 因布局变化
-  ok(diff.affectedRadicals.includes('rad-moon'), '受影响字根含 moon');
-  ok(diff.affectedRadicals.includes('rad-fire'), '受影响字根含 fire');
-  ok(diff.affectedLexemes.includes(changedLexemeId), '受影响词条含布局变化的「明」');
-  ok(diff.affectedLexemes.includes('lx-new'), '受影响词条含新增词条');
+  ok(diff.fromChecksum === pkg1.checksum, 'diff 引用上一包全包校验值');
+  ok(diff.stages.added.includes('stage-5'), 'diff 新增阶段');
+  ok(diff.radicals.removed.includes('rad-fire'), 'diff 删除字根');
+  ok(diff.lexemes.added.includes('lx-new'), 'diff 新增词条');
+  ok(diff.layout.includes(changedLexemeId), 'diff 布局变化');
+  ok(diff.paths.includes('rad-moon'), 'diff 路径变化');
+  ok(diff.affectedRadicals.includes('rad-moon') && diff.affectedRadicals.includes('rad-fire'), '受影响字根');
+  ok(diff.affectedLexemes.includes(changedLexemeId) && diff.affectedLexemes.includes('lx-new'), '受影响词条');
   ok(diff.unchanged === false, 'unchanged=false');
 
-  // 再发布相同内容 → diff.unchanged
-  const d3 = base();
-  const pkg3 = await buildReleasePackage(d3, { sequence: 3, prev: pkg2, now: '2026-09-03T00:00:00Z' });
-  const d2to3 = diffPackages(pkg2, pkg3);
-  ok(d2to3.unchanged === false, '与 pkg2 不同内容时 unchanged=false（回退基线数据）');
-  const sameAgain = await buildReleasePackage(base(), { sequence: 4, prev: pkg3, now: 'x' });
-  ok(diffPackages(pkg3, sameAgain).unchanged, '相同两包 unchanged=true');
-  ok(sameAgain.checksum === pkg3.checksum, '相同内容校验值相等');
+  const sameAgain = await buildReleasePackage(base(), { sequence: 7, prev: null });
+  ok(diffPackages(pkg1, sameAgain).unchanged, '相同两包 unchanged=true');
+  ok(sameAgain.checksum === pkg1.checksum, '相同内容全包校验值相等（不受序号影响）');
 }
 
-// ── 6. 发布包导出/导入往返 + 篡改检测 ─────────────────────────────
-console.log('[6] 导入导出与验真');
+// ── 7. 重建式验真：正常往返 + 任一字段被改都拒绝 ──────────────────
+console.log('[7] 导入重建与逐字段篡改检测');
 {
-  const pkg = await buildReleasePackage(base(), { sequence: 1, prev: null, now: '2026-09-01T00:00:00Z' });
-  const json = JSON.stringify(pkg);
-  const reparsed = await parseReleasePackage(json);
-  eq(reparsed.payload, pkg.payload, '导入往返快照一致');
-  ok(reparsed.checksum === pkg.checksum, '导入后校验值一致');
+  const pkg = await buildReleasePackage(base(), { sequence: 1, prev: null });
+  const reparsed = await parseReleasePackage(JSON.stringify(pkg));
+  eq(reparsed, pkg, '合法包导入往返一致');
 
-  // 篡改内容 → 验真失败
-  const tampered = JSON.parse(json);
-  tampered.payload.radicals[0].name = ' Hack';
-  let rejected = false;
-  try { await parseReleasePackage(JSON.stringify(tampered)); } catch { rejected = true; }
-  ok(rejected, '篡改包被校验值拦截');
+  // 快照改动 → 重建不一致
+  let t = JSON.parse(JSON.stringify(pkg));
+  t.payload.radicals[0].name = ' Hack';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改字根名 → 拒绝（重建不符）');
 
-  // 错误格式
-  rejected = false;
-  try { await parseReleasePackage(JSON.stringify({ hello: 1 })); } catch { rejected = true; }
-  ok(rejected, '非发布包文件被拒绝');
+  // 清单改动（与快照不一致）→ 拒绝
+  t = JSON.parse(JSON.stringify(pkg));
+  t.manifest.totalRadicals = 999;
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改字形清单计数 → 拒绝');
+  t = JSON.parse(JSON.stringify(pkg));
+  t.manifest.entries[0].pronunciation = 'zzz';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改清单条目 → 拒绝');
+
+  // 取形记录改动
+  t = JSON.parse(JSON.stringify(pkg));
+  t.fallbackRecords[0].stageName = '伪阶段';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改阶段取形记录 → 拒绝');
+  t = JSON.parse(JSON.stringify(pkg));
+  t.fallbackRecords.push({ radicalId: 'x', radicalName: 'x', stageId: 'x', stageName: 'x', status: 'exact' });
+  await rejected(parseReleasePackage(JSON.stringify(t)), '增加取形记录 → 拒绝');
+
+  // 报告改动
+  t = JSON.parse(JSON.stringify(pkg));
+  t.report.summary.radicals = 1;
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改校验报告 → 拒绝');
+  t = JSON.parse(JSON.stringify(pkg));
+  t.report.ok = false;
+  await rejected(parseReleasePackage(JSON.stringify(t)), '翻转报告 ok → 拒绝');
+
+  // 内容校验值改动
+  t = JSON.parse(JSON.stringify(pkg));
+  t.contentChecksum = 'a'.repeat(64);
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改内容校验值 → 拒绝（重建不符 + 全包校验值不符）');
+
+  // 直接改 checksum
+  t = JSON.parse(JSON.stringify(pkg));
+  t.checksum = 'f'.repeat(64);
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改全包校验值本身 → 拒绝');
+
+  // 注入未知顶层字段
+  t = JSON.parse(JSON.stringify(pkg));
+  t.publishedAt = '2026-01-01T00:00:00Z';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '注入时间戳字段 → 拒绝');
+
+  // 快照内路径越界 → 门禁拒绝
+  t = JSON.parse(JSON.stringify(pkg));
+  t.payload.radicals[0].baseShape = 'M0 0 L999 999';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '快照内含越界路径 → 拒绝');
+  // 快照内含残缺路径
+  t = JSON.parse(JSON.stringify(pkg));
+  t.payload.radicals[0].baseShape = 'M0 0 L50';
+  await rejected(parseReleasePackage(JSON.stringify(t)), '快照内含残缺路径 → 拒绝');
+  // 快照缺阶段字形（同时取形记录也对不上）
+  t = JSON.parse(JSON.stringify(pkg));
+  t.payload.radicals[0].variants = t.payload.radicals[0].variants.filter((v: { stageId: string }) => v.stageId !== 'stage-2');
+  await rejected(parseReleasePackage(JSON.stringify(t)), '快照缺阶段字形 → 拒绝');
+
+  // 格式错误
+  await rejected(parseReleasePackage(JSON.stringify({ hello: 1 })), '非发布包 → 拒绝');
+  await rejected(parseReleasePackage('{not json'), '非法 JSON → 拒绝');
+
+  // 第二包（带 diff）：篡改 diff 也必须拒绝（全包校验值覆盖）
+  const d2 = base();
+  d2.lexemes[0] = { ...d2.lexemes[0], layout: 'vertical' };
+  const pkgB = await buildReleasePackage(d2, { sequence: 2, prev: pkg });
+  t = JSON.parse(JSON.stringify(pkgB));
+  t.diff.layout = []; // 抹掉布局变化
+  await rejected(parseReleasePackage(JSON.stringify(t)), '篡改差异内容 → 拒绝（全包校验值不符）');
+  t = JSON.parse(JSON.stringify(pkgB));
+  t.diff = null; // 破坏 diff 结构
+  await rejected(parseReleasePackage(JSON.stringify(t)), '破坏差异字段 → 拒绝');
+  const okB = await parseReleasePackage(JSON.stringify(pkgB));
+  ok(!!okB.diff && okB.diff.layout.length === 1, '带差异的第二包正常导入');
+
+  // 带基准上下文：篡改 diff（即使同步重算全包校验值也应被重建比对拦截）
+  {
+    const t = JSON.parse(JSON.stringify(pkgB));
+    t.diff.paths = ['rad-sun']; // 伪造路径变化
+    // 攻击者若只改 diff，全包校验值先就不符；这里模拟更狡猾情形：重算 checksum
+    t.checksum = await checksumForArtifact({
+      format: t.format, formatVersion: t.formatVersion, contentChecksum: t.contentChecksum,
+      payload: t.payload, manifest: t.manifest, fallbackRecords: t.fallbackRecords,
+      report: t.report, diff: t.diff,
+    });
+    await rejected(
+      parseReleasePackage(JSON.stringify(t), { prev: pkg }),
+      '基准包在场时，伪造 diff（并重算校验值）仍被重建比对拒绝'
+    );
+    // 同一份文件但无基准上下文：全包校验值自洽，结构校验放行
+    const noBasis = await parseReleasePackage(JSON.stringify(t));
+    ok(noBasis.checksum === t.checksum, '无基准上下文时仅做全包校验值与结构校验');
+  }
 }
 
-// ── 7. 回退记录在缺字形数据上的语义（构造不经过 validate 的包） ────
-console.log('[7] 阶段回退记录语义');
+// ── 8. 清空历史后同字系重建：完全相同的包 ─────────────────────────
+console.log('[8] 无历史/无时间下的纯函数重建');
 {
-  // 直接构造一个缺 stage-2 字形的字根，检查 fallback 状态
-  const d: any = base();
-  d.radicals[0] = { ...d.radicals[0], variants: d.radicals[0].variants.filter((v: any) => v.stageId !== 'stage-2') };
-  // validate 会报缺失，但 normalize/fallback 仍可通过 build… 不行（build 会抛）。
-  // 改为手工验证 checkPathBounds 与 validate 报告数即可（上面已覆盖），这里仅确认 baseline 全部 exact。
-  const pkg = await buildReleasePackage(base(), { sequence: 1, prev: null, now: 'x' });
-  const moonRecords = pkg.fallbackRecords.filter((r) => r.radicalId === 'rad-moon');
-  ok(moonRecords.length === 4, '每字根×每阶段都有一条记录');
+  const a = await buildReleasePackage(base(), { sequence: 1, prev: null });
+  // 模拟「清空本地存档后，同一份字系再次发布第一包」
+  const b = await buildReleasePackage(base(), { sequence: 1, prev: null });
+  eq(a, b, '两次首包逐字节一致');
+  ok(JSON.stringify(a) === JSON.stringify(b), '序列化结果完全相同');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

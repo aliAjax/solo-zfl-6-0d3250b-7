@@ -66,7 +66,6 @@ export interface ReleaseCheckIssue {
 
 export interface ReleaseCheckReport {
   ok: boolean;
-  checkedAt: string; // 校验规则版本无关的固定字段，值为发布时刻（由构建时注入）
   rules: ReleaseCheckCode[];
   counts: Record<ReleaseCheckCode, number>;
   issues: ReleaseCheckIssue[];
@@ -78,17 +77,19 @@ export interface ReleaseCheckReport {
   };
 }
 
-/** 单个字根在某阶段的回退记录 */
+/**
+ * 单个字根在某阶段的取形记录。
+ * 发布门禁已强制「每个字根在每个阶段都必须有专形」，
+ * 因此合法发布包中只会出现 status='exact'；
+ * 回退/基础/缺形状态在门禁下不可达，记录中不再保留。
+ */
 export interface StageFallbackEntry {
   radicalId: string;
   radicalName: string;
   stageId: string;
   stageName: string;
-  /** exact = 该阶段有专门字形；fallback = 回退到更早阶段；base = 仅能回退到基础字形；missing = 无任何字形 */
-  status: 'exact' | 'fallback' | 'base' | 'missing';
-  /** 实际取形的阶段（status=fallback 时存在） */
-  resolvedStageId?: string;
-  resolvedStageName?: string;
+  /** exact = 该阶段存在专门字形（唯一合法状态） */
+  status: 'exact';
 }
 
 /** 字形清单条目 */
@@ -160,12 +161,18 @@ export interface ReleasePackage {
   /** 固定格式标识 */
   format: 'glyph-evolution-release';
   formatVersion: 1;
-  /** 发布序号（按发布次序递增，导入包重新编号，不参与校验值） */
+  /** 发布序号（按发布次序递增，导入包重新编号，不参与任何校验值） */
   sequence: number;
-  /** 发布时刻 ISO 字符串，不参与校验值 */
-  publishedAt: string;
-  /** 稳定校验值：对语义内容规范化序列化后取 SHA-256 */
+  /**
+   * 全包稳定校验值（SHA-256）：覆盖 payload、字形清单、阶段取形记录、校验报告与差异。
+   * 制品内任一字段被改动，导入验真都会拒绝。
+   */
   checksum: string;
+  /**
+   * 内容校验值（SHA-256）：仅由字系语义内容决定。
+   * 用于判断「同一份字系重复发布」，不随序号/差异变化。
+   */
+  contentChecksum: string;
   /** 快照数据（只读，字根/词条/阶段之后的改动不影响此包） */
   payload: {
     stages: StageSnapshot[];
@@ -233,12 +240,12 @@ export interface WritingSystemActions {
 
   /** 编译当前字系为只读发布包；校验失败时返回 issues 且不改动任何数据/旧包 */
   publishRelease: () => Promise<PublishResult>;
-  /** 导入单个发布包（独立存档，不影响当前编辑数据）；校验值不符会抛错 */
+  /** 导入单个发布包（独立存档，不影响当前编辑数据）；结构/重建/校验值任一不符都会拒绝 */
   importReleasePackage: (json: string) => Promise<ReleasePackage>;
-  /** 删除一个发布包（需二次确认） */
-  removeRelease: (sequence: number) => void;
-  /** 序列化单个发布包用于导出 */
-  serializeRelease: (sequence: number) => string;
+  /** 删除一个发布包（按全包校验值定位，需二次确认） */
+  removeRelease: (checksum: string) => void;
+  /** 序列化单个发布包用于导出（按全包校验值定位） */
+  serializeRelease: (checksum: string) => string;
 }
 
 export type WritingSystemStore = WritingSystemState & WritingSystemActions;
