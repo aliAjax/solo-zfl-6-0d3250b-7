@@ -91,6 +91,119 @@ const stripUndefined = <T extends object>(obj: T): T => {
 
 const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
 
+/**
+ * 按 SVG 规范计算一段弧线的真实几何边界。
+ * 端点在界内并不代表弧段在界内（半径很大时弧身会鼓出画框），
+ * 因此这里走 endpoint → center 参数化，再求弧段上的 x/y 极值点。
+ * 返回弧段上离画框最远的越界点（无越界返回 null）。
+ */
+export function arcBoundsViolation(
+  x1: number, y1: number, x2: number, y2: number,
+  rxIn: number, ryIn: number, phiDeg: number,
+  largeArc: 0 | 1, sweep: 0 | 1
+): { x: number; y: number } | null {
+  // 端点重合：渲染器按直线（无长度）处理，几何上不可能越出端点之外
+  if (Math.abs(x1 - x2) < PATH_EPS && Math.abs(y1 - y2) < PATH_EPS) return null;
+
+  let rx = Math.abs(rxIn);
+  let ry = Math.abs(ryIn);
+  const phi = (phiDeg * Math.PI) / 180;
+  const cosPhi = Math.cos(phi);
+  const sinPhi = Math.sin(phi);
+
+  const dx2 = (x1 - x2) / 2;
+  const dy2 = (y1 - y2) / 2;
+  // 旋转到椭圆轴与坐标轴对齐的坐标系
+  const xp1 = cosPhi * dx2 + sinPhi * dy2;
+  const yp1 = -sinPhi * dx2 + cosPhi * dy2;
+
+  // 半径太小无法连接两端时，按规范放大到恰好可连接
+  const lambda = (xp1 * xp1) / (rx * rx) + (yp1 * yp1) / (ry * ry);
+  if (lambda > 1) {
+    const scale = Math.sqrt(lambda);
+    rx *= scale;
+    ry *= scale;
+  }
+
+  const rx2 = rx * rx;
+  const ry2 = ry * ry;
+  const x1p2 = xp1 * xp1;
+  const y1p2 = yp1 * yp1;
+  let numerator = rx2 * ry2 - rx2 * y1p2 - ry2 * x1p2;
+  if (numerator < 0) numerator = 0;
+  const denom = rx2 * y1p2 + ry2 * x1p2;
+  let coef = Math.sqrt(numerator / denom);
+  if (largeArc === sweep) coef = -coef;
+
+  const cxp = coef * ((rx * yp1) / ry);
+  const cyp = coef * (-(ry * xp1) / rx);
+  const cx = cosPhi * cxp - sinPhi * cyp + (x1 + x2) / 2;
+  const cy = sinPhi * cxp + cosPhi * cyp + (y1 + y2) / 2;
+
+  const angle = (ux: number, uy: number, vx: number, vy: number) => {
+    const dot = ux * vx + uy * vy;
+    const len = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+    let a = Math.acos(Math.min(1, Math.max(-1, dot / len)));
+    if (ux * vy - uy * vx < 0) a = -a;
+    return a;
+  };
+
+  const theta1 = angle(1, 0, (xp1 - cxp) / rx, (yp1 - cyp) / ry);
+  let dTheta = angle(
+    (xp1 - cxp) / rx, (yp1 - cyp) / ry,
+    (-xp1 - cxp) / rx, (-yp1 - cyp) / ry
+  );
+  if (sweep === 0 && dTheta > 0) dTheta -= 2 * Math.PI;
+  if (sweep === 1 && dTheta < 0) dTheta += 2 * Math.PI;
+
+  // 椭圆参数方程（已旋转回画布坐标）：
+  // x(θ) = cx + cosφ·rx·cosθ − sinφ·ry·sinθ
+  // y(θ) = cy + sinφ·rx·cosθ + cosφ·ry·sinθ
+  const onArc = (t: number) => {
+    // 以 θ1 为起点，把候选角折进扫掠区间 [0, dTheta]（dTheta 带符号）
+    let u = t - theta1;
+    if (dTheta >= 0) {
+      while (u > dTheta + PATH_EPS) u -= 2 * Math.PI;
+      while (u < -PATH_EPS) u += 2 * Math.PI;
+      return u >= -PATH_EPS && u <= dTheta + PATH_EPS;
+    }
+    while (u < dTheta - PATH_EPS) u += 2 * Math.PI;
+    while (u > PATH_EPS) u -= 2 * Math.PI;
+    return u <= PATH_EPS && u >= dTheta - PATH_EPS;
+  };
+  const pointAt = (t: number) => ({
+    x: cx + cosPhi * rx * Math.cos(t) - sinPhi * ry * Math.sin(t),
+    y: cy + sinPhi * rx * Math.cos(t) + cosPhi * ry * Math.sin(t),
+  });
+
+  const inBounds = (x: number, y: number) => x >= -PATH_EPS && x <= PATH_BOUND + PATH_EPS && y >= -PATH_EPS && y <= PATH_BOUND + PATH_EPS;
+  const candidates: number[] = [theta1, theta1 + dTheta]; // 两个端点
+  // x 极值参数角：d/dt [cx + cosφ·rx·cos t − sinφ·ry·sin t] = 0
+  const baseX = Math.atan2(-sinPhi * ry, cosPhi * rx);
+  // y 极值参数角：d/dt [cy + sinφ·rx·cos t + cosφ·ry·sin t] = 0
+  const baseY = Math.atan2(cosPhi * ry, sinPhi * rx);
+  for (const b of [baseX, baseY]) {
+    for (const t of [b, b + Math.PI]) {
+      // 每个方向恰有两个极值点（相差 π）；是否落在弧段上由 onArc 判定
+      if (onArc(t)) candidates.push(t);
+    }
+  }
+
+  let worst: { x: number; y: number } | null = null;
+  let worstScore = 0;
+  for (const t of candidates) {
+    const p = pointAt(t);
+    if (!inBounds(p.x, p.y)) {
+      const over = Math.max(-p.x, p.x - PATH_BOUND, -p.y, p.y - PATH_BOUND, 0);
+      if (over > worstScore) {
+        worstScore = over;
+        worst = { x: round6(p.x), y: round6(p.y) };
+      }
+    }
+  }
+  return worst;
+}
+
 // ── 路径检查（严格语法 + 画框越界） ─────────────────────────────────
 
 /** 每个路径命令每一轮消耗的数字个数 */
@@ -247,9 +360,31 @@ export function checkPath(svgPath: string): PathProblem[] {
           if (nums[4] !== 0 && nums[4] !== 1) {
             return [{ kind: 'syntax', message: `弧线扫描标志位非法：${nums[4]}（只允许 0 或 1）` }];
           }
+          if (![nums[0], nums[1], nums[2]].every(Number.isFinite)) {
+            return [{ kind: 'syntax', message: `弧线参数含非有限数字：(${nums[0]}, ${nums[1]}, ${nums[2]})` }];
+          }
           const x = resolve(5, cx);
           const y = resolve(6, cy);
+          // 终点必须在界内
           flagBounds(x, y);
+          // 弧身（椭圆弧段的真实几何）也必须完全落在画框内；
+          // 负半径按规范取绝对值；半径为 0 时退化为直线段，终点检查已足够
+          const arcRx = Math.abs(nums[0]);
+          const arcRy = Math.abs(nums[1]);
+          if (arcRx > 0 && arcRy > 0) {
+            const hit = arcBoundsViolation(
+              cx, cy, x, y, arcRx, arcRy, nums[2],
+              nums[3] as 0 | 1, nums[4] as 0 | 1
+            );
+            if (hit) {
+              problems.push({
+                kind: 'bounds',
+                x: hit.x,
+                y: hit.y,
+                message: `弧线弧身越出画框（极值点约 (${hit.x}, ${hit.y})，终点在界内也不允许）`,
+              });
+            }
+          }
           cx = x; cy = y;
           break;
         }

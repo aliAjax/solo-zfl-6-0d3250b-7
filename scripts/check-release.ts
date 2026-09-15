@@ -3,6 +3,7 @@ import { MOCK_STAGES, MOCK_RADICALS, MOCK_LEXEMES } from '../src/utils/mockData'
 import {
   buildReleasePackage,
   checkPath,
+  arcBoundsViolation,
   diffPackages,
   parseReleasePackage,
   validateWritingSystem,
@@ -141,6 +142,103 @@ console.log('[4] 路径语法严格校验');
     'M50 50 m10 0 l10 10',
   ];
   for (const p of good) ok(checkPath(p).length === 0, `放行合法路径：${p.slice(0, 24)}…`);
+
+  // ── 弧线主体几何：终点在框内、弧身鼓出画框必须被拦 ──
+  // (40,50)→(60,50)，rx=ry=33：四种标志位组合中，取大弧时椭圆极值 x≈17..83、y≈17..83 在框内；
+  // 改用更大半径 55：大弧一侧圆心约在 (50,≈22.4)/(50,≈77.6)，极值触及 y≈−32.6 / 132.6
+  const arcBodies = [
+    ['大弧+顺时针鼓出', 'M40 50 A55 55 0 1 1 60 50'],
+    ['大弧+逆时针鼓出', 'M40 50 A55 55 0 1 0 60 50'],
+    ['小弧近圆鼓出（负半径取绝对值）', 'M40 50 A-55 -55 0 1 1 60 50'],
+    ['相对弧线同样按几何判定', 'M40 50 a55 55 0 1 1 20 0'],
+    ['旋转椭圆鼓出', 'M50 30 A60 20 45 1 1 50 70'],
+  ] as const;
+  for (const [label, p] of arcBodies) {
+    const probs = checkPath(p);
+    ok(probs.some((x) => x.message.includes('弧身')), `拦截：${label}`);
+  }
+  // 小半径短弧（弧身完全在框内）放行；同一起终点的小弧不越界
+  const arcOk = [
+    'M40 50 A33 33 0 0 1 60 50',
+    'M40 50 A33 33 0 0 0 60 50',
+    'M10 10 a5 5 0 0 1 10 0',
+    'M50 30 A30 12 0 0 1 50 70',
+  ];
+  for (const p of arcOk) ok(checkPath(p).length === 0, `放行弧身在框内：${p.slice(0, 26)}…`);
+  // 端点本身越界仍要报（旧门禁不回退）
+  ok(checkPath('M10 10 A20 20 0 0 1 130 50').some((x) => x.message.includes('超出')), '弧线终点越界仍拦截');
+  // 端点重合：零长度弧不产生弧身
+  ok(checkPath('M50 50 A60 60 0 1 1 50 50').length === 0, '端点重合零长度弧放行');
+
+  // 数值交叉验证：解析极值 vs 2000 点采样的真实包围盒
+  {
+    const sampledExtent = (
+      x1: number, y1: number, x2: number, y2: number,
+      rx0: number, ry0: number, phiDeg: number, la: 0 | 1, sw: 0 | 1
+    ) => {
+      let rx = Math.abs(rx0), ry = Math.abs(ry0);
+      const phi = (phiDeg * Math.PI) / 180;
+      const c = Math.cos(phi), s = Math.sin(phi);
+      const dx = (x1 - x2) / 2, dy = (y1 - y2) / 2;
+      const xp = c * dx + s * dy, yp = -s * dx + c * dy;
+      const lam = (xp * xp) / (rx * rx) + (yp * yp) / (ry * ry);
+      if (lam > 1) { const k = Math.sqrt(lam); rx *= k; ry *= k; }
+      const num = Math.max(0, rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp);
+      const den = rx * rx * yp * yp + ry * ry * xp * xp;
+      let k2 = Math.sqrt(num / den);
+      if (la === sw) k2 = -k2;
+      const cxp = k2 * ((rx * yp) / ry), cyp = k2 * (-(ry * xp) / rx);
+      const ccx = c * cxp - s * cyp + (x1 + x2) / 2;
+      const ccy = s * cxp + c * cyp + (y1 + y2) / 2;
+      const ang = (ux: number, uy: number, vx: number, vy: number) => {
+        let a = Math.acos(Math.min(1, Math.max(-1, (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy)))));
+        if (ux * vy - uy * vx < 0) a = -a;
+        return a;
+      };
+      const t1 = ang(1, 0, (xp - cxp) / rx, (yp - cyp) / ry);
+      let dt = ang((xp - cxp) / rx, (yp - cyp) / ry, (-xp - cxp) / rx, (-yp - cyp) / ry);
+      if (sw === 0 && dt > 0) dt -= 2 * Math.PI;
+      if (sw === 1 && dt < 0) dt += 2 * Math.PI;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (let j = 0; j <= 2000; j++) {
+        const t = t1 + (dt * j) / 2000;
+        const x = ccx + c * rx * Math.cos(t) - s * ry * Math.sin(t);
+        const y = ccy + s * rx * Math.cos(t) + c * ry * Math.sin(t);
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      }
+      return { minX, minY, maxX, maxY };
+    };
+
+    let mismatch = 0;
+    let total = 0;
+    const ends: [number, number][] = [[10, 50], [40, 50], [50, 10], [50, 50], [90, 90], [20, 30], [80, 20]];
+    const radii: [number, number][] = [[5, 5], [20, 8], [33, 33], [55, 55], [80, 30], [120, 120], [40, 60]];
+    const phis = [0, 30, 45, 90];
+    for (const [x1, y1] of ends) {
+      for (const [x2, y2] of ends) {
+        if (x1 === x2 && y1 === y2) continue;
+        for (const [rx, ry] of radii) {
+          for (const phi of phis) {
+            for (const la of [0, 1] as const) {
+              for (const sw of [0, 1] as const) {
+                total++;
+                const e = sampledExtent(x1, y1, x2, y2, rx, ry, phi, la, sw);
+                const over = Math.max(-e.minX, e.maxX - 100, -e.minY, e.maxY - 100, 0);
+                const realOut = over > 1e-4;
+                const hit = !!arcBoundsViolation(x1, y1, x2, y2, rx, ry, phi, la, sw);
+                if (hit !== realOut) {
+                  mismatch++;
+                  if (mismatch <= 5) console.log(`    几何不一致: (${x1},${y1})→(${x2},${y2}) r=${rx}/${ry} φ=${phi} la=${la} sw=${sw} over=${over.toFixed(3)} hit=${hit}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    ok(mismatch === 0, `弧线几何判定与数值采样一致（${total} 组合，不一致 ${mismatch}）`);
+  }
 
   // 语法问题也必须进入发布门禁
   const d = base();

@@ -176,9 +176,12 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
 
       publishRelease: async () => {
         const state = get();
-        // 上一包 = 存档中的最后一个包（本地发布或导入包均可作为对照基准）
-        const prev = state.releases[state.releases.length - 1] ?? null;
-        const sequence = state.releases.length + 1;
+        // 上一包 = 序号最大者（删除中间包后序号可能不连续，max+1 保证唯一可比较）
+        const prev = state.releases.reduce<ReleasePackage | null>(
+          (m, p) => (!m || p.sequence > m.sequence ? p : m),
+          null
+        );
+        const sequence = (prev?.sequence ?? 0) + 1;
 
         let pkg: ReleasePackage;
         try {
@@ -222,9 +225,21 @@ export const useWritingSystemStore = create<WritingSystemStore>()(
         if (state.releases.some((r) => r.checksum === pkg.checksum)) {
           throw new Error('该发布包已在发布台中（校验值相同）');
         }
-        // 制品原样入库：序号与差异是包的一部分（受全包校验值保护），不重写
-        set((s) => ({ releases: [...s.releases, pkg] }));
-        return pkg;
+        // 序号不参与全包校验值：缺失/越界/与本地冲突时重编为 max+1，
+        // 保证删除中间包或跨存档导入后序号始终唯一、可比较。
+        const used = new Set(state.releases.map((r) => r.sequence));
+        const maxSeq = state.releases.reduce((m, r) => Math.max(m, r.sequence), 0);
+        let stored = pkg;
+        if (
+          typeof pkg.sequence !== 'number' ||
+          !Number.isInteger(pkg.sequence) ||
+          pkg.sequence <= 0 ||
+          used.has(pkg.sequence)
+        ) {
+          stored = { ...pkg, sequence: maxSeq + 1 };
+        }
+        set((s) => ({ releases: [...s.releases, stored] }));
+        return stored;
       },
 
       removeRelease: (checksum) =>

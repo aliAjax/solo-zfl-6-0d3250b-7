@@ -194,6 +194,25 @@ const ok = (cond, msg) => {
   ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), '残缺路径时发布按钮禁用');
   await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
 
+  // 弧线主体越界（终点在框内、弧身鼓出画框）也必须被门禁拦截：重置后注入弧线
+  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
+  await page.goto(BASE + '#/glyphs');
+  await page.waitForSelector('text=字形库');
+  // zustand 仅在状态变更后写盘：点一张字根卡触发持久化
+  await page.locator('.group.relative.bg-parchment-50').first().click();
+  await page.waitForFunction((key) => !!localStorage.getItem(key), STORAGE_KEY);
+  await page.evaluate((key) => {
+    const data = JSON.parse(localStorage.getItem(key));
+    data.state.radicals[0].baseShape = 'M40 50 A55 55 0 1 1 60 50';
+    localStorage.setItem(key, JSON.stringify(data));
+  }, STORAGE_KEY);
+  await page.goto(BASE);
+  await page.goto(BASE + '#/publish');
+  await page.waitForSelector('text=项待修');
+  await page.waitForSelector('text=弧身');
+  ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), '弧线主体越界时发布按钮禁用');
+  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
+
   // ── 9. 全局控制台错误 ─────────────────────────────────────────
   console.log('[B8] 浏览器控制台错误检查');
   const interesting = errors.filter((e) =>

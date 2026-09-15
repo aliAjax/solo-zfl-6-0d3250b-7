@@ -115,5 +115,68 @@ console.log('[S9] 清空存档后同字系首包重建结果逐字节一致');
   ok(a.pkg!.checksum === b.pkg!.checksum && a.pkg!.contentChecksum === b.pkg!.contentChecksum, '两层校验值均相同');
 }
 
+console.log('[S10] 序号：删除中间包不冲突；导入冲突/非连续时唯一');
+{
+  useWritingSystemStore.setState({ releases: [] });
+  const pa = (await useWritingSystemStore.getState().publishRelease()).pkg!; // 1
+  // 制造第二个不同内容的包
+  useWritingSystemStore.getState().updateRadical(
+    useWritingSystemStore.getState().radicals[0].id,
+    { meaning: useWritingSystemStore.getState().radicals[0].meaning + '·' }
+  );
+  const pb = (await useWritingSystemStore.getState().publishRelease()).pkg!; // 2
+  useWritingSystemStore.getState().updateRadical(
+    useWritingSystemStore.getState().radicals[0].id,
+    { meaning: useWritingSystemStore.getState().radicals[0].meaning + '·' }
+  );
+  const pc = (await useWritingSystemStore.getState().publishRelease()).pkg!; // 3
+  ok([pa.sequence, pb.sequence, pc.sequence].join() === '1,2,3', '初始序号连续 1,2,3');
+
+  // 删除中间包 2
+  useWritingSystemStore.getState().removeRelease(pb.checksum);
+  useWritingSystemStore.getState().updateRadical(
+    useWritingSystemStore.getState().radicals[0].id,
+    { meaning: useWritingSystemStore.getState().radicals[0].meaning + '·' }
+  );
+  const pd = (await useWritingSystemStore.getState().publishRelease()).pkg!;
+  ok(pd.sequence === 4, `删除中间包后新序号取 max+1=4（实际 ${pd.sequence}），不与现存 1/3 冲突`);
+  const seqs = useWritingSystemStore.getState().releases.map((r) => r.sequence).sort((a, b) => a - b);
+  ok(new Set(seqs).size === seqs.length, '所有序号唯一');
+
+  // 导入原序号为 4 的冲突包：内容相同会被去重，因此构造一个自洽的异号包
+  // 取一个全新内容发布到独立 store 视角不现实；改为：序列化 pd 后把序号改成 4，
+  // 再把 checksum 字段保持不变（序号不参与全包校验值，验真仍通过）——
+  // 但内容相同会先被「校验值去重」拦下。所以用一个内容不同的包：恢复被删除的 pb。
+  // pb 原序号 2，在当前存档中空闲，应原样保留序号导入。
+  const pbJson = JSON.stringify(pb);
+  const back = await useWritingSystemStore.getState().importReleasePackage(pbJson);
+  ok(back.sequence === 2, `序号空闲时保留原序号 2（实际 ${back.sequence}）`);
+
+  // 再导入一份序号被改为 5（与现存 pd.sequence=5? 不，现存最大为4）→ 改为 4 制造冲突
+  const foreign = JSON.parse(pbJson);
+  foreign.sequence = 4;
+  const imported = await useWritingSystemStore.getState().importReleasePackage(JSON.stringify(foreign)).catch(() => null);
+  // 与 back 同校验值，去重必然拒绝——这正是期望：内容同一性优先
+  ok(imported === null, '同校验值包即使序号不同仍被去重拒绝');
+  const allSeqs = useWritingSystemStore.getState().releases.map((r) => r.sequence);
+  ok(new Set(allSeqs).size === allSeqs.length && allSeqs.every((n) => Number.isInteger(n) && n > 0), '导入后序号仍全部唯一且为正整数');
+
+  // 真正的冲突重编：用一个序号被占用但内容不同的自洽包
+  useWritingSystemStore.getState().updateRadical(
+    useWritingSystemStore.getState().radicals[0].id,
+    { meaning: '冲突重编测试' }
+  );
+  const pe = (await useWritingSystemStore.getState().publishRelease()).pkg!;
+  const peJson = JSON.stringify(pe);
+  const clash = JSON.parse(peJson);
+  clash.sequence = 2; // 已被 pb 占据
+  // clash 与 pe 同内容会被去重；先删除 pe 再导入 clash，此时内容唯一、序号冲突
+  useWritingSystemStore.getState().removeRelease(pe.checksum);
+  const fixed = await useWritingSystemStore.getState().importReleasePackage(JSON.stringify(clash));
+  ok(fixed.sequence >= 5, `序号冲突时重编为 max+1（实际 ${fixed.sequence}），不与 1/2/4 撞号`);
+  const finalSeqs = useWritingSystemStore.getState().releases.map((r) => r.sequence);
+  ok(new Set(finalSeqs).size === finalSeqs.length, '重编后序号唯一');
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 if (fail > 0) process.exit(1);
