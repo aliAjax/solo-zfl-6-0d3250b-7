@@ -211,6 +211,23 @@ const ok = (cond, msg) => {
   await page.waitForSelector('text=项待修');
   await page.waitForSelector('text=弧身');
   ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), '弧线主体越界时发布按钮禁用');
+
+  // Z 闭合后相对命令以子路径起点为基准越界：l96 在回位点 (5,95) 上得 x=101
+  await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
+  await page.goto(BASE + '#/glyphs');
+  await page.waitForSelector('text=字形库');
+  await page.locator('.group.relative.bg-parchment-50').first().click();
+  await page.waitForFunction((key) => !!localStorage.getItem(key), STORAGE_KEY);
+  await page.evaluate((key) => {
+    const data = JSON.parse(localStorage.getItem(key));
+    data.state.radicals[0].baseShape = 'M5 95 l0 -90 h90 Z l96 0';
+    localStorage.setItem(key, JSON.stringify(data));
+  }, STORAGE_KEY);
+  await page.goto(BASE);
+  await page.goto(BASE + '#/publish');
+  await page.waitForSelector('text=项待修');
+  await page.waitForSelector('text=超出');
+  ok(await page.getByRole('button', { name: /存在校验问题，无法发布/ }).isDisabled(), 'Z 后相对命令越界时发布按钮禁用');
   await page.evaluate((key) => localStorage.removeItem(key), STORAGE_KEY);
 
   // ── 9. 全局控制台错误 ─────────────────────────────────────────

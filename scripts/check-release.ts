@@ -247,6 +247,46 @@ console.log('[4] 路径语法严格校验');
   ok(iss.some((i) => i.code === 'path-out-of-bounds' && i.message.includes('路径无效')), '残缺路径在发布门禁中报「路径无效」');
 }
 
+// ── 4b. 闭合与子路径状态 ──────────────────────────────────────────
+console.log('[4b] Z 回位、相对命令基准与子路径重置');
+{
+  // Z 之后相对命令必须以子路径起点为当前点：
+  // M5 95（近角起点）→ l0 -90 → h90 → Z 回 (5,95) → l95 0 恰落 x=100（界内边界）
+  ok(checkPath('M5 95 l0 -90 h90 Z l95 0').length === 0, 'Z 后相对命令从子路径起点计算（恰在边界内）');
+  const hit = checkPath('M5 95 l0 -90 h90 Z l96 0');
+  ok(hit.length === 1 && hit[0].kind === 'bounds' && Math.abs((hit[0].x ?? 0) - 101) < 1e-3,
+    `Z 后相对命令以起点为基准判越界（实际 ${hit[0]?.x},${hit[0]?.y}）`);
+
+  // 相对 V 同样以回位点为基准：Z 回 (10,90)，v10→y=100 边界内，v11→y=101 越界
+  ok(checkPath('M10 90 l0 -80 h80 Z v10').length === 0, 'Z 后相对 V 从起点 y=90 计，到 100 恰在界内');
+  const vHit = checkPath('M10 90 l0 -80 h80 Z v11');
+  ok(vHit.some((q) => q.kind === 'bounds' && Math.abs((q.y ?? 0) - 101) < 1e-3),
+    `Z 后相对 v 越界（y=101，实际 ${vHit.find((q) => q.kind === 'bounds')?.y}）`);
+
+  // 未闭合时相对命令沿上一笔位置（不回位）
+  ok(checkPath('M10 90 l0 -80 h80 l6 0').length === 0, '未闭合：(10,90)→(10,10)→(90,10)→(96,10) 全在界内');
+  ok(checkPath('M10 90 l0 -80 h80 l11 0').some((q) => q.kind === 'bounds'), '未闭合时以上一笔终点为基准：(90,10)+l11→x=101');
+
+  // 新 M 开始新子路径并重置起点：第二子路径 Z 回自己的 (10,10)
+  ok(checkPath('M5 95 l0 -90 h90 Z M10 10 l80 0 l0 80 Z l0 5').length === 0,
+    '新子路径 Z 回到各自起点（(10,10)+l0 5 到 15 界内）');
+  const multiHit = checkPath('M5 95 l0 -90 h90 Z M10 10 l80 0 l0 80 Z l0 -11');
+  // 若错误回到第一子路径起点 (5,95)，l0 -11→84 不越界；正确回 (10,10)→y=-1
+  ok(multiHit.some((q) => q.kind === 'bounds' && Math.abs((q.y ?? 0) - -1) < 1e-3),
+    `新子路径 Z 回该子路径自己的起点（y=-1，实际 ${multiHit.find((q) => q.kind === 'bounds')?.y}）`);
+
+  // 隐式重复 M 的坐标对等同 L，不重置子路径起点
+  ok(checkPath('M5 95 95 95 Z l95 0').length === 0, '隐式 M 坐标对不重置子路径起点（回 (5,95)，+95=100）');
+  ok(checkPath('M5 95 95 95 Z l96 0').some((q) => q.kind === 'bounds'), '隐式 M 后 Z 回首起点，l96→x=101 越界');
+
+  // 连续 Z 幂等：仍停在子路径起点
+  ok(checkPath('M10 10 h80 v80 h-80 Z Z l0 -11').some((q) => q.kind === 'bounds'), '连续 Z 幂等回位，随后相对上移 y=-1 越界');
+  ok(checkPath('M10 10 h80 v80 h-80 Z Z l5 0').length === 0, '连续 Z 后合法相对移动放行');
+
+  // 多子路径既有图形仍合法（口字外框 + 两横）
+  ok(checkPath('M28 30 L72 30 L78 78 L22 78 Z M32 46 L68 46 M34 60 L66 60').length === 0, '多子路径范例合法');
+}
+
 // ── 5. 校验失败原子性 ─────────────────────────────────────────────
 console.log('[5] 失败原子性');
 {

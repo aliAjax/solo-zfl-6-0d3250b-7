@@ -269,6 +269,10 @@ export function checkPath(svgPath: string): PathProblem[] {
 
   let cx = 0;
   let cy = 0;
+  // 当前子路径起点：Z 闭合后当前点必须回到它，后续相对命令以它为基准；
+  // 每个 M（首个坐标对）开启新子路径并重置该起点。
+  let sx = 0;
+  let sy = 0;
   let i = 0;
   let started = false;
 
@@ -284,16 +288,16 @@ export function checkPath(svgPath: string): PathProblem[] {
     const rel = t.cmd !== upper;
     const argc = COMMAND_ARGS[upper];
 
-    // 数字命令可隐式重复（如 M 后多对坐标）；Z 不消费数字
+    // Z 不消费数字：闭合当前子路径，当前点回到当前子路径起点
+    if (upper === 'Z') {
+      cx = sx;
+      cy = sy;
+      continue;
+    }
+
+    // 数字命令可隐式重复（如 M 后多对坐标）
     let firstRound = true;
     do {
-      if (upper === 'Z') {
-        if (!firstRound) break;
-        firstRound = false;
-        break;
-      }
-      firstRound = false;
-
       const nums: number[] = [];
       while (nums.length < argc && i < tokens.length && tokens[i].type === 'num') {
         nums.push((tokens[i] as { type: 'num'; n: number }).n);
@@ -311,11 +315,16 @@ export function checkPath(svgPath: string): PathProblem[] {
 
       switch (upper) {
         case 'M': {
-          if (!started) started = true;
           const x = resolve(0, cx);
           const y = resolve(1, cy);
           flagBounds(x, y);
           cx = x; cy = y;
+          if (firstRound) {
+            // 新子路径：重置起点；隐式重复的坐标对等同于 L，沿用当前子路径
+            started = true;
+            sx = x;
+            sy = y;
+          }
           break;
         }
         case 'L':
@@ -365,7 +374,7 @@ export function checkPath(svgPath: string): PathProblem[] {
           }
           const x = resolve(5, cx);
           const y = resolve(6, cy);
-          // 终点必须在界内
+          // 终点必须在界内（相对命令以 Z 回位后的当前点为基准）
           flagBounds(x, y);
           // 弧身（椭圆弧段的真实几何）也必须完全落在画框内；
           // 负半径按规范取绝对值；半径为 0 时退化为直线段，终点检查已足够
@@ -389,6 +398,7 @@ export function checkPath(svgPath: string): PathProblem[] {
           break;
         }
       }
+      firstRound = false;
     } while (i < tokens.length && tokens[i].type === 'num');
   }
 
